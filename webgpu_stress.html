@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Stress Test</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            font-family: Arial, sans-serif;
+        }
+        #controls {
+            margin-bottom: 20px;
+        }
+        #startButton {
+            padding: 10px 20px;
+            font-size: 18px;
+            cursor: pointer;
+        }
+        #stats {
+            margin-top: 10px;
+            font-size: 14px;
+        }
+        canvas {
+            border: 1px solid #333;
+            background-color: cyan;
+        }
+        #sliderContainer {
+            margin-top: 20px;
+            width: 1000px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        #stressSlider {
+            width: 100%;
+        }
+        #sliderLabel {
+            margin-top: 10px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <button id="startButton">Start Stress</button>
+        <div id="stats">Triangles: 0</div>
+    </div>
+    <canvas id="gpuCanvas" width="1000" height="1000"></canvas>
+    <div id="sliderContainer">
+        <input type="range" id="stressSlider" min="0" max="16384" value="0" step="1">
+        <div id="sliderLabel">Stress Buffer: 0 MB</div>
+    </div>
+
+    <script type="module">
+        const MAX_STORAGE_BUFFERS_PER_STAGE = 8; // WebGPU limit
+        let maxStressMB = 0; // Will be calculated based on device limits
+
+        let device, context, pipeline;
+        let renderTarget = null;
+        let copyPipeline = null;
+        let copyBindGroup = null;
+        let isRunning = false;
+        let triangleCount = 0;
+        let vertexBuffer = null;
+        let stressBuffers = []; // Array of stress buffers
+        let stressBindGroup = null;
+        let interopBuffer = null;
+        let interopEnabled = false;
+        let interopBusy = false;
+        let interopFrame = 0;
+        let maxBufferSize = 0; // Will be set during init
+        let numStressBuffers = 0; // Number of buffer slots in shader
+        let maxStressSlots = 0; // Number of slots used for regular stress buffers
+        let mlContext = null;
+        let mlGraph = null;
+        let mlInputTensor = null;
+        let mlOutputTensor = null;
+        let mlInputData = null;
+        const canvas = document.getElementById('gpuCanvas');
+        const startButton = document.getElementById('startButton');
+        const statsDiv = document.getElementById('stats');
+        const stressSlider = document.getElementById('stressSlider');
+        const sliderLabel = document.getElementById('sliderLabel');
+
+        function generateShaderCode(numBuffers) {
+            // Generate buffer bindings
+            let bufferBindings = '';
+            let bufferReads = '';
+            for (let i = 0; i < numBuffers; i++) {
+                bufferBindings += `            @group(0) @binding(${i}) var<storage, read> stressBuffer${i}: array<f32>;\n`;
+                bufferReads += `                if (arrayLength(&stressBuffer${i}) > 0u) { dummy += stressBuffer${i}[0]; }\n`;
+            }
+
+            return `
+            struct VertexInput {
+                @location(0) position: vec2f,
+                @location(1) color: vec4f,
+            }
+
+            struct VertexOutput {
+                @builtin(position) position: vec4f,
+                @location(0) color: vec4f,
+            }
+
+${bufferBindings}
+            @vertex
+            fn vertexMain(input: VertexInput) -> VertexOutput {
+                var output: VertexOutput;
+                // Position is already in clip space (-1 to 1)
+                output.position = vec4f(input.position, 0.0, 1.0);
+                output.color = input.color;
+                // Read from stress buffers (result discarded, just to cause memory access)
+                var dummy: f32 = 0.0;
+${bufferReads}                _ = dummy;
+                return output;
+            }
+
+            @fragment
+            fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+                return input.color;
+            }
+        `;
+        }
+
+        async function initWebNNInterop() {
+            if (!('ml' in navigator)) {
+                console.warn('WebNN is not available. Running WebGPU-only stress mode.');
+                return;
+            }
+
+            try {
+                mlContext = await navigator.ml.createContext({ deviceType: 'gpu' });
+
+                const interopElements = 1024;
+                const tensorDescriptor = {
+                    dataType: 'float32',
+                    shape: [interopElements],
+                    writable: true,
+                    readable: false
+                };
+
+                const builder = new MLGraphBuilder(mlContext);
+                const input = builder.input('x', {
+                    dataType: tensorDescriptor.dataType,
+                    shape: tensorDescriptor.shape
+                });
+                const output = builder.relu(input);
+                mlGraph = await builder.build({ y: output });
+
+                mlInputTensor = await mlContext.createTensor(tensorDescriptor);
+                mlOutputTensor = await mlContext.createExportableTensor(tensorDescriptor, device);
+                mlInputData = new Float32Array(interopElements);
+                interopEnabled = true;
+            } catch (e) {
+                console.warn('Failed to initialize WebNN interop. Running WebGPU-only stress mode.', e);
+                interopEnabled = false;
+            }
+        }
+
+        function rebuildStressBindGroup() {
+            const entries = [];
+            for (let i = 0; i < numStressBuffers; i++) {
+                const boundBuffer = (i === 0 && interopBuffer) ? interopBuffer : stressBuffers[i];
+                entries.push({
+                    binding: i,
+                    resource: { buffer: boundBuffer }
+                });
+            }
+            stressBindGroup = device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries
+            });
+        }
+
+        async function runInteropStep() {
+            if (!interopEnabled || interopBusy) {
+                return;
+            }
+
+            interopBusy = true;
+            try {
+                // The exported GPU buffer must be destroyed before this tensor can
+                // be used by WebNN again on some implementations.
+                if (interopBuffer) {
+                    interopBuffer.destroy();
+                    interopBuffer = null;
+                    rebuildStressBindGroup();
+                }
+
+                for (let i = 0; i < mlInputData.length; i++) {
+                    mlInputData[i] = Math.sin((i + interopFrame) * 0.01);
+                }
+                interopFrame++;
+
+                mlContext.writeTensor(mlInputTensor, mlInputData);
+                mlContext.dispatch(mlGraph, { x: mlInputTensor }, { y: mlOutputTensor });
+
+                interopBuffer = await mlContext.exportToGPU(mlOutputTensor);
+                rebuildStressBindGroup();
+            } catch (e) {
+                console.error('WebNN interop step failed:', e);
+                interopEnabled = false;
+                if (interopBuffer) {
+                    interopBuffer.destroy();
+                }
+                interopBuffer = null;
+                rebuildStressBindGroup();
+            } finally {
+                interopBusy = false;
+            }
+        }
+
+        async function initWebGPU() {
+            // Check WebGPU support
+            if (!navigator.gpu) {
+                alert('WebGPU is not supported in this browser.');
+                return false;
+            }
+
+            // Request adapter and device
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) {
+                alert('Failed to get GPU adapter.');
+                return false;
+            }
+
+            // Request device with maximum storage buffer binding size
+            const adapterLimits = adapter.limits;
+            device = await adapter.requestDevice({
+                requiredLimits: {
+                    maxStorageBufferBindingSize: adapterLimits.maxStorageBufferBindingSize,
+                    maxBufferSize: adapterLimits.maxBufferSize
+                }
+            });
+
+            // Store the max buffer size for chunking
+            maxBufferSize = device.limits.maxStorageBufferBindingSize;
+
+            // Calculate how many buffer slots we can use (limited by per-stage max)
+            numStressBuffers = MAX_STORAGE_BUFFERS_PER_STAGE;
+            // Reserve one binding for WebNN exportToGPU interop and use the rest for stress.
+            maxStressSlots = Math.max(1, numStressBuffers - 1);
+
+            // Calculate actual max stress size based on device limits
+            maxStressMB = Math.floor((maxStressSlots * maxBufferSize) / (1024 * 1024));
+            console.log(`Max buffer size: ${maxBufferSize}, stress slots: ${maxStressSlots}, max stress: ${maxStressMB} MB`);
+
+            // Update slider max to match actual capability
+            stressSlider.max = maxStressMB;
+            sliderLabel.textContent = `Stress Buffer: 0 MB (max ${(maxStressMB / 1024).toFixed(1)} GB)`;
+
+            // Configure canvas context
+            context = canvas.getContext('webgpu');
+            const format = navigator.gpu.getPreferredCanvasFormat();
+            context.configure({
+                device: device,
+                format: format,
+                alphaMode: 'premultiplied',
+            });
+
+            // Create shader module with dynamically generated buffer bindings
+            const shaderCode = generateShaderCode(numStressBuffers);
+            const shaderModule = device.createShaderModule({
+                code: shaderCode
+            });
+
+            // Create render pipeline
+            pipeline = device.createRenderPipeline({
+                layout: 'auto',
+                vertex: {
+                    module: shaderModule,
+                    entryPoint: 'vertexMain',
+                    buffers: [{
+                        arrayStride: 24, // 2 floats position + 4 floats color = 6 * 4 bytes
+                        attributes: [
+                            {
+                                // position
+                                shaderLocation: 0,
+                                offset: 0,
+                                format: 'float32x2'
+                            },
+                            {
+                                // color
+                                shaderLocation: 1,
+                                offset: 8,
+                                format: 'float32x4'
+                            }
+                        ]
+                    }]
+                },
+                fragment: {
+                    module: shaderModule,
+                    entryPoint: 'fragmentMain',
+                    targets: [{
+                        format: format,
+                        blend: {
+                            color: {
+                                srcFactor: 'src-alpha',
+                                dstFactor: 'one-minus-src-alpha',
+                                operation: 'add'
+                            },
+                            alpha: {
+                                srcFactor: 'one',
+                                dstFactor: 'one-minus-src-alpha',
+                                operation: 'add'
+                            }
+                        }
+                    }]
+                },
+                primitive: {
+                    topology: 'triangle-list'
+                }
+            });
+
+            // Create a single vertex buffer for one triangle (3 vertices * 6 floats * 4 bytes = 72 bytes)
+            vertexBuffer = device.createBuffer({
+                size: 72,
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+            });
+
+            // Create persistent render target texture
+            renderTarget = device.createTexture({
+                size: [canvas.width, canvas.height],
+                format: format,
+                usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+            });
+
+            // Create fullscreen copy shader to blit render target to canvas
+            const copyShaderModule = device.createShaderModule({
+                code: `
+                    @vertex
+                    fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4f {
+                        // Fullscreen triangle
+                        var pos = array<vec2f, 3>(
+                            vec2f(-1.0, -1.0),
+                            vec2f(3.0, -1.0),
+                            vec2f(-1.0, 3.0)
+                        );
+                        return vec4f(pos[vertexIndex], 0.0, 1.0);
+                    }
+
+                    @group(0) @binding(0) var texSampler: sampler;
+                    @group(0) @binding(1) var tex: texture_2d<f32>;
+
+                    @fragment
+                    fn fragmentMain(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+                        let uv = pos.xy / vec2f(${canvas.width}.0, ${canvas.height}.0);
+                        return textureSample(tex, texSampler, uv);
+                    }
+                `
+            });
+
+            copyPipeline = device.createRenderPipeline({
+                layout: 'auto',
+                vertex: {
+                    module: copyShaderModule,
+                    entryPoint: 'vertexMain'
+                },
+                fragment: {
+                    module: copyShaderModule,
+                    entryPoint: 'fragmentMain',
+                    targets: [{ format: format }]
+                },
+                primitive: {
+                    topology: 'triangle-list'
+                }
+            });
+
+            const sampler = device.createSampler({
+                magFilter: 'nearest',
+                minFilter: 'nearest'
+            });
+
+            copyBindGroup = device.createBindGroup({
+                layout: copyPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: sampler },
+                    { binding: 1, resource: renderTarget.createView() }
+                ]
+            });
+
+            // Clear the render target initially
+            const initEncoder = device.createCommandEncoder();
+            const initPass = initEncoder.beginRenderPass({
+                colorAttachments: [{
+                    view: renderTarget.createView(),
+                    loadOp: 'clear',
+                    clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                    storeOp: 'store'
+                }]
+            });
+            initPass.end();
+            device.queue.submit([initEncoder.finish()]);
+
+            // Create initial minimal stress buffers (4 bytes each)
+            stressBuffers = [];
+            for (let i = 0; i < numStressBuffers; i++) {
+                const buffer = device.createBuffer({
+                    size: 4,
+                    usage: GPUBufferUsage.STORAGE
+                });
+                stressBuffers.push(buffer);
+            }
+
+            await initWebNNInterop();
+            rebuildStressBindGroup();
+
+            return true;
+        }
+
+        function generateRandomTriangle() {
+            // Generate 3 random vertices with random colors
+            const vertices = [];
+            for (let i = 0; i < 3; i++) {
+                // Random position in clip space (-1 to 1)
+                const x = Math.random() * 2 - 1;
+                const y = Math.random() * 2 - 1;
+
+                // Random color with alpha
+                const r = Math.random();
+                const g = Math.random();
+                const b = Math.random();
+                const a = 0.5 + Math.random() * 0.5; // Alpha between 0.5 and 1.0
+
+                vertices.push(x, y, r, g, b, a);
+            }
+            return vertices;
+        }
+
+        async function render() {
+            if (!isRunning) return;
+
+            await runInteropStep();
+
+            // Generate and upload a single new triangle
+            const newTriangle = generateRandomTriangle();
+            const vertexData = new Float32Array(newTriangle);
+            device.queue.writeBuffer(vertexBuffer, 0, vertexData);
+
+            triangleCount++;
+            statsDiv.textContent = `Triangles: ${triangleCount}`;
+
+            // Create command encoder
+            const commandEncoder = device.createCommandEncoder();
+
+            // Render pass 1: Draw triangle to persistent render target (preserving previous content)
+            const trianglePass = commandEncoder.beginRenderPass({
+                colorAttachments: [{
+                    view: renderTarget.createView(),
+                    loadOp: 'load', // Preserve previous triangles
+                    storeOp: 'store'
+                }]
+            });
+
+            trianglePass.setPipeline(pipeline);
+            trianglePass.setVertexBuffer(0, vertexBuffer);
+            if (stressBindGroup) {
+                trianglePass.setBindGroup(0, stressBindGroup);
+            }
+            trianglePass.draw(3);
+            trianglePass.end();
+
+            // Render pass 2: Copy render target to canvas swap chain
+            const copyPass = commandEncoder.beginRenderPass({
+                colorAttachments: [{
+                    view: context.getCurrentTexture().createView(),
+                    loadOp: 'clear',
+                    clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                    storeOp: 'store'
+                }]
+            });
+
+            copyPass.setPipeline(copyPipeline);
+            copyPass.setBindGroup(0, copyBindGroup);
+            copyPass.draw(3);
+            copyPass.end();
+
+            // Submit commands
+            device.queue.submit([commandEncoder.finish()]);
+
+            // Schedule next frame
+            requestAnimationFrame(render);
+        }
+
+        startButton.addEventListener('click', () => {
+            if (!isRunning) {
+                isRunning = true;
+                startButton.textContent = 'Stop Stress';
+                requestAnimationFrame(render);
+            } else {
+                isRunning = false;
+                startButton.textContent = 'Start Stress';
+            }
+        });
+
+        function updateStressBuffer(sizeMB) {
+            const totalBytes = sizeMB * 1024 * 1024;
+
+            try {
+                // Calculate target size for each buffer slot
+                const targetSizes = [];
+                let remainingBytes = totalBytes;
+                for (let i = 0; i < numStressBuffers; i++) {
+                    if (i === 0) {
+                        // Binding 0 reserved for WebNN interop buffer.
+                        targetSizes.push(4);
+                        continue;
+                    }
+
+                    if (remainingBytes > 0) {
+                        const chunkSize = Math.min(remainingBytes, maxBufferSize);
+                        targetSizes.push(chunkSize);
+                        remainingBytes -= chunkSize;
+                    } else {
+                        targetSizes.push(4); // Minimal size for unused slots
+                    }
+                }
+
+                // Resize buffers that need to change
+                let needsNewBindGroup = false;
+                for (let i = 0; i < numStressBuffers; i++) {
+                    if (i === 0) {
+                        continue;
+                    }
+
+                    const currentSize = stressBuffers[i].size;
+                    const targetSize = targetSizes[i];
+
+                    if (currentSize !== targetSize) {
+                        stressBuffers[i].destroy();
+                        stressBuffers[i] = device.createBuffer({
+                            size: targetSize,
+                            usage: GPUBufferUsage.STORAGE
+                        });
+                        needsNewBindGroup = true;
+                    }
+                }
+
+                // Recreate bind group if any buffer changed
+                if (needsNewBindGroup) {
+                    rebuildStressBindGroup();
+                }
+            } catch (e) {
+                console.error('Failed to allocate stress buffers:', e);
+                sliderLabel.textContent = `Stress Buffer: Failed at ${sizeMB} MB`;
+                return;
+            }
+
+            // Count how many buffers are larger than minimal
+            const activeBuffers = stressBuffers.slice(1).filter(b => b.size > 4).length;
+
+            // Update label
+            if (sizeMB >= 1024) {
+                sliderLabel.textContent = `Stress Buffer: ${(sizeMB / 1024).toFixed(1)} GB (${activeBuffers} active buffer${activeBuffers !== 1 ? 's' : ''})`;
+            } else {
+                sliderLabel.textContent = `Stress Buffer: ${sizeMB} MB (${activeBuffers} active buffer${activeBuffers !== 1 ? 's' : ''})`;
+            }
+        }
+
+        stressSlider.addEventListener('input', () => {
+            const sizeMB = parseInt(stressSlider.value);
+            updateStressBuffer(sizeMB);
+        });
+
+        // Initialize WebGPU when page loads
+        initWebGPU().then(success => {
+            if (!success) {
+                startButton.disabled = true;
+                startButton.textContent = 'WebGPU Not Available';
+            }
+        });
+    </script>
+</body>
+</html>
+ 
