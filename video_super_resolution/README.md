@@ -20,7 +20,7 @@ This sample benchmarks WebNN and WebGPU zero-copy interop using a video super re
 ## Run
 
 1. Open `video_super_resolution.html` in Chromium (or serve this folder statically).
-2. Select profile, WebNN device, GPU adapter, and measurement mode.
+2. Select model format, WebNN device, GPU adapter, and measurement mode.
 3. For full pipeline mode, select a source (synthetic, camera, or local video).
 4. Click Start.
 

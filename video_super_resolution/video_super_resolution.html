@@ -42,7 +42,7 @@
   <h1>WebNN + WebGPU Zero-Copy Video Super Resolution (VSR) Benchmark</h1>
 
   <div id="controls">
-    <label>Profile
+    <label title="Model I/O tensor shape + memory layout (CHW/HWC) + data type">Model format
       <select id="profileSel">
         <option value="A">A &mdash; CHW fp32 [1,3,400,400]</option>
         <option value="C" selected>C &mdash; HWC fp32 [1,256,288,3]</option>
@@ -67,6 +67,12 @@
       <select id="measureSel">
         <option value="interop" selected>Interop only (WebNN&#8644;WebGPU)</option>
         <option value="full">Full pipeline</option>
+      </select>
+    </label>
+    <label title="Full pipeline only: flush (onSubmittedWorkDone) each frame to measure serialized per-frame latency, or skip the flush and pace with requestAnimationFrame to allow pipelining (reports throughput/FPS)">Flush
+      <select id="flushSel">
+        <option value="on" selected>Per-frame (onSubmittedWorkDone)</option>
+        <option value="off">Off (rAF-paced, pipelined)</option>
       </select>
     </label>
     <label>Source
@@ -637,18 +643,32 @@ async function runLoop() {
         }
       } else if (srcVideo.readyState >= 2 && srcVideo.videoWidth > 0) {
         await ensureResources(profile);
+        const flush = $('flushSel').value; // 'on' = onSubmittedWorkDone, 'off' = rAF-paced
         const t0 = performance.now();
         processFrame(profile);
-        await device.queue.onSubmittedWorkDone();
+        if (flush === 'on') {
+          // Flush: wait for the whole frame to finish -> serialized latency.
+          await device.queue.onSubmittedWorkDone();
+        } else {
+          // No flush: pace on the next animation frame so the pipeline can
+          // overlap frames (present happens naturally) -> throughput.
+          await new Promise((r) => requestAnimationFrame(() => r()));
+        }
         const dt = performance.now() - t0;
 
         frames++;
         frameTimeSum += dt;
         const now = performance.now();
         if (now - lastFpsTime >= 500) {
-          const avgMs = frameTimeSum / frames;
-          $('fps').textContent =
-            `${avgMs.toFixed(2)} ms/frame · ${geom.numTiles} tiles/frame`;
+          if (flush === 'on') {
+            const avgMs = frameTimeSum / frames;
+            $('fps').textContent =
+              `${avgMs.toFixed(2)} ms/frame (flush) · ${geom.numTiles} tiles/frame`;
+          } else {
+            const fps = (frames * 1000) / (now - lastFpsTime);
+            $('fps').textContent =
+              `${fps.toFixed(1)} fps (rAF, pipelined) · ${geom.numTiles} tiles/frame`;
+          }
           frames = 0; frameTimeSum = 0; lastFpsTime = now;
         }
       } else {
