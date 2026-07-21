@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WebNN + WebGPU Zero-Copy Video Super Resolution Benchmark</title>
+<title>WebNN + WebGPU Zero-Copy Super Resolution Benchmark</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -39,7 +39,7 @@
 </style>
 </head>
 <body>
-  <h1>WebNN + WebGPU Zero-Copy Video Super Resolution (VSR) Benchmark</h1>
+  <h1>WebNN + WebGPU Zero-Copy Super Resolution (SR) Benchmark</h1>
 
   <div id="controls">
     <label title="Model I/O tensor shape + memory layout (CHW/HWC) + data type">Model format
@@ -103,7 +103,7 @@
 
 <script type="module">
 // =============================================================================
-// WebNN + WebGPU zero-copy Video Super Resolution benchmark.
+// WebNN + WebGPU zero-copy Super Resolution benchmark.
 //
 // Measures the per-frame latency of the WebGPU <-> WebNN exportable-tensor
 // interop path (single WebGPU submit per stage, single WebNN dispatch/frame):
@@ -421,7 +421,7 @@ async function startSyntheticSource() {
     }
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 48px monospace';
-    ctx.fillText('WebNN VSR ' + (t.toFixed(1)), 40, 80);
+    ctx.fillText('WebNN SR ' + (t.toFixed(1)), 40, 80);
     ctx.font = '16px monospace';
     ctx.fillText('fine detail row: ||||||||||||||||||||||||||||||||||||||||', 40, 120);
     if (mediaStream) requestAnimationFrame(draw);

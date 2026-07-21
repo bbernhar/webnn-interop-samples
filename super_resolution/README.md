@@ -1,10 +1,10 @@
-# Video Super Resolution Sample
+# Super Resolution Sample
 
-This sample benchmarks WebNN and WebGPU zero-copy interop using a video super resolution style pipeline.
+This sample benchmarks WebNN and WebGPU zero-copy interop using a super resolution style pipeline.
 
 ## File
 
-- `video_super_resolution.html`
+- `super_resolution.html`
 
 ## What it measures
 
@@ -19,7 +19,7 @@ This sample benchmarks WebNN and WebGPU zero-copy interop using a video super re
 
 ## Run
 
-1. Open `video_super_resolution.html` in Chromium (or serve this folder statically).
+1. Open `super_resolution.html` in Chromium (or serve this folder statically).
 2. Select model format, WebNN device, GPU adapter, and measurement mode.
 3. For full pipeline mode, select a source (synthetic, camera, or local video).
 4. Click Start.
