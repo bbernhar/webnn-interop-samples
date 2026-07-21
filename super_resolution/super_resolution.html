@@ -36,6 +36,26 @@
   .stat { font-variant-numeric: tabular-nums; }
   .err { color: #ff8a80; }
   .ok { color: #a5d6a7; }
+
+  /* Pipeline diagram */
+  #pipeline { margin: 4px 0 18px; overflow-x: auto; }
+  .chips { display: flex; align-items: stretch; flex-wrap: nowrap; width: max-content; }
+  .chip {
+    background: #1c1f24; border: 1px solid #33373d; border-radius: 6px;
+    padding: 6px 8px; min-width: 84px; text-align: center;
+  }
+  .chip .name { font-size: 11px; color: #cdd2d7; white-space: pre-line; line-height: 1.15; }
+  .chip .val { font-size: 12px; font-variant-numeric: tabular-nums; color: #a5d6a7; margin-top: 4px; min-height: 15px; }
+  .arrow { align-self: center; color: #6b7178; padding: 0 6px; font-size: 14px; }
+  .spanbar {
+    position: relative; height: 24px; margin-top: 6px;
+    border-top: 2px solid #5c9ded; border-left: 2px solid #5c9ded; border-right: 2px solid #5c9ded;
+    width: max-content; min-width: 100%;
+  }
+  .span-label {
+    position: absolute; top: 5px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: #9ecbff; white-space: nowrap; background: #14161a; padding: 0 8px;
+  }
 </style>
 </head>
 <body>
@@ -86,6 +106,11 @@
     <button id="startBtn">Start</button>
     <button id="stopBtn" disabled>Stop</button>
     <span id="fps" class="stat"></span>
+  </div>
+
+  <div id="pipeline">
+    <div class="chips" id="chips"></div>
+    <div class="spanbar"><span class="span-label" id="spanLabel"></span></div>
   </div>
 
   <div id="stage">
@@ -175,7 +200,7 @@ const outCanvas = $('outCanvas');
 // Per-frame latency bookkeeping.
 let frames = 0, frameTimeSum = 0, lastFpsTime = 0;
 // Interop-only per-call accumulators (per cycle, ms).
-let expSum = 0, destSum = 0, dispSum = 0, gpuWaitSum = 0;
+let expInSum = 0, expOutSum = 0, destInSum = 0, destOutSum = 0, dispSum = 0, gpuWaitSum = 0;
 
 // =============================================================================
 // WGSL shaders (parameterized at runtime via a uniform block).
@@ -577,19 +602,19 @@ function processFrame(profile) {
 //   dispatchPerCycleMs- the WebNN dispatch call (queueing cost, not execution)
 //   gpuWaitPerCycleMs - backend completion wait (onSubmittedWorkDone)
 async function measureInterop(reps) {
-  let expMs = 0, destMs = 0, dispMs = 0;
+  let expInMs = 0, destInMs = 0, dispMs = 0, expOutMs = 0, destOutMs = 0;
   for (let i = 0; i < reps; i++) {
     const a = performance.now();
     const inBuf = mlContext.exportToGPU(inputTensor);
-    const b = performance.now(); expMs += b - a;
+    const b = performance.now(); expInMs += b - a;
     inBuf.destroy(); // ownership -> WebNN
-    const c = performance.now(); destMs += c - b;
+    const c = performance.now(); destInMs += c - b;
 
     mlContext.dispatch(mlGraph, { input: inputTensor }, { output: outputTensor });
     const d = performance.now(); dispMs += d - c;
 
     const outBuf = mlContext.exportToGPU(outputTensor);
-    const e = performance.now(); expMs += e - d;
+    const e = performance.now(); expOutMs += e - d;
 
     if (i === reps - 1) {
       const enc = device.createCommandEncoder();
@@ -598,16 +623,18 @@ async function measureInterop(reps) {
     }
     const f = performance.now();
     outBuf.destroy(); // ownership -> WebNN
-    destMs += performance.now() - f;
+    destOutMs += performance.now() - f;
   }
   const tSubmit = performance.now();
   await device.queue.onSubmittedWorkDone();
   const gpuWaitMs = performance.now() - tSubmit;
   return {
-    exportPerCycleMs: expMs / reps,
-    destroyPerCycleMs: destMs / reps,
-    dispatchPerCycleMs: dispMs / reps,
-    gpuWaitPerCycleMs: gpuWaitMs / reps,
+    expInMs: expInMs / reps,
+    destInMs: destInMs / reps,
+    dispMs: dispMs / reps,
+    expOutMs: expOutMs / reps,
+    destOutMs: destOutMs / reps,
+    gpuWaitMs: gpuWaitMs / reps,
   };
 }
 
@@ -626,20 +653,24 @@ async function runLoop() {
         const m = await measureInterop(INTEROP_REPS);
 
         frames++;
-        expSum += m.exportPerCycleMs;
-        destSum += m.destroyPerCycleMs;
-        dispSum += m.dispatchPerCycleMs;
-        gpuWaitSum += m.gpuWaitPerCycleMs;
+        expInSum += m.expInMs; destInSum += m.destInMs; dispSum += m.dispMs;
+        expOutSum += m.expOutMs; destOutSum += m.destOutMs; gpuWaitSum += m.gpuWaitMs;
         const now = performance.now();
         if (now - lastFpsTime >= 500) {
-          const exp = (expSum / frames) * 1000;
-          const dst = (destSum / frames) * 1000;
+          const eIn = (expInSum / frames) * 1000;
+          const dIn = (destInSum / frames) * 1000;
           const dsp = (dispSum / frames) * 1000;
+          const eOut = (expOutSum / frames) * 1000;
+          const dOut = (destOutSum / frames) * 1000;
           const gpu = (gpuWaitSum / frames) * 1000;
+          const total = eIn + dIn + dsp + eOut + dOut + gpu;
+          setChip('expIn', eIn); setChip('destIn', dIn); setChip('disp', dsp);
+          setChip('expOut', eOut); setChip('destOut', dOut); setChip('gpuWait', gpu);
+          $('spanLabel').textContent = `Interop cycle = ${total.toFixed(0)} µs (×${INTEROP_REPS})`;
           $('fps').textContent =
-            `${(exp + dst + dsp + gpu).toFixed(0)} µs/cyc = export×2 ${exp.toFixed(0)} · ` +
-            `destroy×2 ${dst.toFixed(0)} · dispatch ${dsp.toFixed(0)} · GPU-wait ${gpu.toFixed(0)} (×${INTEROP_REPS})`;
-          frames = 0; expSum = 0; destSum = 0; dispSum = 0; gpuWaitSum = 0; lastFpsTime = now;
+            `${total.toFixed(0)} µs/cyc = export ${(eIn + eOut).toFixed(0)} · ` +
+            `destroy ${(dIn + dOut).toFixed(0)} · dispatch ${dsp.toFixed(0)} · GPU-wait ${gpu.toFixed(0)} (×${INTEROP_REPS})`;
+          frames = 0; expInSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
         }
       } else if (srcVideo.readyState >= 2 && srcVideo.videoWidth > 0) {
         await ensureResources(profile);
@@ -664,10 +695,12 @@ async function runLoop() {
             const avgMs = frameTimeSum / frames;
             $('fps').textContent =
               `${avgMs.toFixed(2)} ms/frame (flush) · ${geom.numTiles} tiles/frame`;
+            $('spanLabel').textContent = `Full frame = ${avgMs.toFixed(2)} ms/frame (flush)`;
           } else {
             const fps = (frames * 1000) / (now - lastFpsTime);
             $('fps').textContent =
               `${fps.toFixed(1)} fps (rAF, pipelined) · ${geom.numTiles} tiles/frame`;
+            $('spanLabel').textContent = `Full frame = ${fps.toFixed(1)} fps (rAF, pipelined)`;
           }
           frames = 0; frameTimeSum = 0; lastFpsTime = now;
         }
@@ -710,7 +743,8 @@ async function start() {
     running = true;
     $('stopBtn').disabled = false;
     lastFpsTime = performance.now(); frames = 0; frameTimeSum = 0;
-    expSum = 0; destSum = 0; dispSum = 0; gpuWaitSum = 0;
+    expInSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0;
+    renderPipelineDiagram();
     log('Running (measuring per-frame latency).', 'ok');
     runLoop();
   } catch (e) {
@@ -732,13 +766,63 @@ function stop() {
 }
 
 // =============================================================================
+// Pipeline diagram (live stage chips + measured-span bracket).
+// Only the stages a mode actually runs/measures are rendered, so the bracket
+// underneath spans exactly what the current metric captures.
+// =============================================================================
+const CHIP_META = {
+  video:   'Video\nframe',
+  import:  'import\next texture',
+  expIn:   'exportToGPU\n(input)',
+  pre:     'preprocess\ncompute',
+  destIn:  'destroy\n(input)',
+  disp:    'WebNN\ndispatch',
+  expOut:  'exportToGPU\n(output)',
+  render:  'render',
+  destOut: 'destroy\n(output)',
+  present: 'present',
+  gpuWait: 'completion\n(GPU-wait)',
+};
+const PIPELINE_STAGES = {
+  interop: ['expIn', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
+  full:    ['video', 'import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
+};
+function setChip(key, us) {
+  const el = document.getElementById('val-' + key);
+  if (el) el.textContent = `${us.toFixed(0)} µs`;
+}
+function renderPipelineDiagram() {
+  const mode = $('measureSel').value;
+  const stages = PIPELINE_STAGES[mode] || PIPELINE_STAGES.interop;
+  const chips = $('chips');
+  chips.innerHTML = '';
+  stages.forEach((key, i) => {
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    chip.innerHTML = `<div class="name">${CHIP_META[key]}</div><div class="val" id="val-${key}"></div>`;
+    chips.appendChild(chip);
+    if (i < stages.length - 1) {
+      const ar = document.createElement('span');
+      ar.className = 'arrow';
+      ar.textContent = '\u2192';
+      chips.appendChild(ar);
+    }
+  });
+  $('spanLabel').textContent = mode === 'interop'
+    ? 'Interop cycle — measured span'
+    : 'Full frame — measured span';
+}
+
+// =============================================================================
 // UI wiring.
 // =============================================================================
 $('sourceSel').addEventListener('change', () => {
   $('fileInput').style.display = $('sourceSel').value === 'file' ? '' : 'none';
 });
+$('measureSel').addEventListener('change', renderPipelineDiagram);
 $('startBtn').addEventListener('click', start);
 $('stopBtn').addEventListener('click', stop);
+renderPipelineDiagram();
 
 log('Ready. Requires a Chromium build with WebNN + WebGPU exportable-tensor interop enabled.');
 log('Tip: launch with --enable-features=WebMachineLearningNeuralNetwork and WebGPU enabled.');
