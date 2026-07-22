@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WebNN + WebGPU Zero-Copy Super Resolution Benchmark</title>
+<title>WebNN + WebGPU Super Resolution Benchmark</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -23,6 +23,7 @@
   }
   #controls label { font-size: 13px; display: inline-flex; gap: 6px; align-items: center; }
   select, button, input[type=file] { font-size: 13px; padding: 6px 8px; }
+  select:disabled { opacity: 0.45; cursor: not-allowed; }
   button { cursor: pointer; }
   #stage { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
   figure { margin: 0; }
@@ -39,6 +40,7 @@
 
   /* Pipeline diagram */
   #pipeline { margin: 4px 0 18px; overflow-x: auto; }
+  .pipeline-title { font-size: 13px; font-weight: 600; color: #e8eaed; margin-bottom: 8px; }
   .chips { display: flex; align-items: stretch; flex-wrap: nowrap; width: max-content; }
   .chip {
     background: #1c1f24; border: 1px solid #33373d; border-radius: 6px;
@@ -46,6 +48,7 @@
   }
   .chip .name { font-size: 11px; color: #cdd2d7; white-space: pre-line; line-height: 1.15; }
   .chip .val { font-size: 12px; font-variant-numeric: tabular-nums; color: #a5d6a7; margin-top: 4px; min-height: 15px; }
+  .chip .batch { font-size: 10px; color: #9aa0a6; margin-top: 2px; }
   .arrow { align-self: center; color: #6b7178; padding: 0 6px; font-size: 14px; }
   .spanbar {
     position: relative; height: 24px; margin-top: 6px;
@@ -56,10 +59,15 @@
     position: absolute; top: 5px; left: 50%; transform: translateX(-50%);
     font-size: 12px; color: #9ecbff; white-space: nowrap; background: #14161a; padding: 0 8px;
   }
+  .legend { margin-top: 10px; font-size: 11px; color: #9aa0a6; display: inline-flex; align-items: center; gap: 6px; }
+  .legend .swatch {
+    width: 12px; height: 12px; border-radius: 3px; background: #a5d6a7;
+    display: inline-block; flex: 0 0 auto;
+  }
 </style>
 </head>
 <body>
-  <h1>WebNN + WebGPU Zero-Copy Super Resolution (SR) Benchmark</h1>
+  <h1>WebNN + WebGPU Super Resolution (SR) Benchmark</h1>
 
   <div id="controls">
     <label title="Model I/O tensor shape + memory layout (CHW/HWC) + data type">Model format
@@ -83,16 +91,24 @@
         <option value="fallback">fallback (software)</option>
       </select>
     </label>
-    <label title="Interop only: measure just the WebNN&lt;-&gt;WebGPU export/destroy/dispatch handshake, with no video import, preprocess, or render/present">Measure
+    <label title="Interop only: measure just the WebNN&lt;-&gt;WebGPU export/destroy/dispatch handshake, with no video import, preprocess, or render/present">Pipeline
       <select id="measureSel">
-        <option value="interop" selected>Interop only (WebNN&#8644;WebGPU)</option>
+        <option value="interop" selected>Interop only</option>
         <option value="full">Full pipeline</option>
       </select>
     </label>
-    <label title="Full pipeline only: flush (onSubmittedWorkDone) each frame to measure serialized per-frame latency, or skip the flush and pace with requestAnimationFrame to allow pipelining (reports throughput/FPS)">Flush
+    <label title="Full pipeline only: wait for each frame to complete (onSubmittedWorkDone) to measure serialized per-frame latency, or skip the wait and pace with requestAnimationFrame to allow pipelining (reports throughput/FPS)">Frame completion
       <select id="flushSel">
-        <option value="on" selected>Per-frame (onSubmittedWorkDone)</option>
-        <option value="off">Off (rAF-paced, pipelined)</option>
+        <option value="on" selected>Serialized (per-frame flush)</option>
+        <option value="off">Pipelined (rAF)</option>
+      </select>
+    </label>
+    <label title="Frame resolution for the synthetic source and the interop-only fallback (camera / local file use their own native size)">Resolution
+      <select id="resSel">
+        <option value="640x360">640 &times; 360</option>
+        <option value="1280x720" selected>1280 &times; 720</option>
+        <option value="1920x1080">1920 &times; 1080</option>
+        <option value="3840x2160">3840 &times; 2160</option>
       </select>
     </label>
     <label>Source
@@ -105,12 +121,13 @@
     <input type="file" id="fileInput" accept="video/*" style="display:none">
     <button id="startBtn">Start</button>
     <button id="stopBtn" disabled>Stop</button>
-    <span id="fps" class="stat"></span>
   </div>
 
   <div id="pipeline">
+    <div class="pipeline-title" id="pipelineTitle">Per-frame pipeline</div>
     <div class="chips" id="chips"></div>
     <div class="spanbar"><span class="span-label" id="spanLabel"></span></div>
+    <div class="legend"><span class="swatch"></span> Per-stage timings are CPU wall-time, averaged.</div>
   </div>
 
   <div id="stage">
@@ -128,7 +145,7 @@
 
 <script type="module">
 // =============================================================================
-// WebNN + WebGPU zero-copy Super Resolution benchmark.
+// WebNN + WebGPU Super Resolution benchmark.
 //
 // Measures the per-frame latency of the WebGPU <-> WebNN exportable-tensor
 // interop path (single WebGPU submit per stage, single WebNN dispatch/frame):
@@ -180,7 +197,7 @@ let currentAdapterKey = null; // tracks the powerPreference/fallback the device 
 let mlContext = null;
 let mlGraph = null;
 let inputTensor = null, outputTensor = null;
-let preprocPipeline, renderPipeline;
+let preprocPipeline, renderPipeline, interopPipeline;
 let uniformBuffer = null;
 let scratchBuffer = null;
 
@@ -200,7 +217,7 @@ const outCanvas = $('outCanvas');
 // Per-frame latency bookkeeping.
 let frames = 0, frameTimeSum = 0, lastFpsTime = 0;
 // Interop-only per-call accumulators (per cycle, ms).
-let expInSum = 0, expOutSum = 0, destInSum = 0, destOutSum = 0, dispSum = 0, gpuWaitSum = 0;
+let expInSum = 0, wgpuSum = 0, expOutSum = 0, destInSum = 0, destOutSum = 0, dispSum = 0, gpuWaitSum = 0;
 
 // =============================================================================
 // WGSL shaders (parameterized at runtime via a uniform block).
@@ -315,6 +332,25 @@ fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
 }
 `.replace(/CHANNELS_U/g, `${CHANNELS}u`);
 
+// Interop compute: a trivial WebGPU compute pass over the exported tensor
+// buffer (stands in for the preprocess/postprocess a real app would run on the
+// shared buffer while it owns it), so the interop cycle exercises actual WebGPU
+// work on the tensor rather than exporting and immediately handing it back.
+const INTEROP_COMPUTE_WGSL = `
+@group(0) @binding(0) var<storage, read_write> buf : array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(num_workgroups) nwg : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  // Linearize a 2D workgroup grid so large tensors stay within the
+  // maxComputeWorkgroupsPerDimension limit at high resolutions.
+  let wg = wid.x + wid.y * nwg.x;
+  let i = wg * 256u + lid.x;
+  if (i >= arrayLength(&buf)) { return; }
+  buf[i] = buf[i] * 1.0;
+}
+`;
+
 // =============================================================================
 // WebGPU / WebNN initialization.
 // =============================================================================
@@ -374,6 +410,11 @@ async function initGPU() {
     primitive: { topology: 'triangle-list' },
   });
 
+  interopPipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: device.createShaderModule({ code: INTEROP_COMPUTE_WGSL }), entryPoint: 'main' },
+  });
+
   log('WebGPU initialized.', 'ok');
 }
 
@@ -382,21 +423,21 @@ async function initML(deviceType) {
   mlContext = await navigator.ml.createContext({ deviceType });
   log(`WebNN context created (deviceType="${deviceType}").`, 'ok');
 
-  // Probe zero-copy interop support before committing to it.
+  // Probe tensor export / WebGPU interop support before committing to it.
   try {
     const probe = await mlContext.createExportableTensor(
       { dataType: 'float32', shape: [1] }, device);
     mlContext.exportToGPU(probe);
     probe.destroy();
   } catch (e) {
-    throw new Error(`Zero-copy tensor export unsupported on this backend: ${e.name}: ${e.message}`);
+    throw new Error(`Tensor export (WebGPU interop) unsupported on this backend: ${e.name}: ${e.message}`);
   }
   log('WebNN <-> WebGPU exportable-tensor interop supported.', 'ok');
 }
 
 // Build the WebNN graph for a given batched shape.
 // Minimal passthrough graph: a single multiply-by-1. This keeps the full WebNN
-// dispatch + zero-copy exportable-tensor interop path intact while removing all
+// dispatch + exportable-tensor interop path intact while removing all
 // model compute, so the measured latency reflects interop/dispatch overhead
 // rather than math. Swap this for a real SR graph to do actual enhancement.
 async function buildGraph(profile, numTiles) {
@@ -420,7 +461,7 @@ async function buildGraph(profile, numTiles) {
 // =============================================================================
 async function startSyntheticSource() {
   // Animated, detail-rich pattern so the enhancement is visible.
-  const w = 1280, h = 720;
+  const { w, h } = getResolution();
   const cvs = document.createElement('canvas');
   cvs.width = w; cvs.height = h;
   const ctx = cvs.getContext('2d');
@@ -480,8 +521,9 @@ function stopSource() {
 // Geometry + resource (re)build when source dims or profile change.
 // =============================================================================
 async function ensureResources(profile) {
-  const frameW = srcVideo.videoWidth || 1280;
-  const frameH = srcVideo.videoHeight || 720;
+  const res = getResolution();
+  const frameW = srcVideo.videoWidth || res.w;
+  const frameH = srcVideo.videoHeight || res.h;
 
   if (geom && geom.frameW === frameW && geom.frameH === frameH &&
       geom.profile === profile.name) {
@@ -601,14 +643,36 @@ function processFrame(profile) {
 //   destroyPerCycleMs - the two GPUBuffer.destroy() ownership hand-backs
 //   dispatchPerCycleMs- the WebNN dispatch call (queueing cost, not execution)
 //   gpuWaitPerCycleMs - backend completion wait (onSubmittedWorkDone)
-async function measureInterop(reps) {
-  let expInMs = 0, destInMs = 0, dispMs = 0, expOutMs = 0, destOutMs = 0;
+async function measureInterop(reps, profile) {
+  const elements = geom.numTiles * CHANNELS * profile.tileH * profile.tileW;
+  const wgTotal = Math.ceil(elements / 256);
+  const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
+  const wgX = Math.min(wgTotal, maxDim);
+  const wgY = Math.ceil(wgTotal / wgX);
+  let expInMs = 0, wgpuMs = 0, destInMs = 0, dispMs = 0, expOutMs = 0, destOutMs = 0;
   for (let i = 0; i < reps; i++) {
     const a = performance.now();
     const inBuf = mlContext.exportToGPU(inputTensor);
     const b = performance.now(); expInMs += b - a;
+
+    // WebGPU compute dispatch over the exported input buffer (while WebGPU owns it).
+    const bind = device.createBindGroup({
+      layout: interopPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: inBuf } }],
+    });
+    const enc0 = device.createCommandEncoder();
+    {
+      const pass = enc0.beginComputePass();
+      pass.setPipeline(interopPipeline);
+      pass.setBindGroup(0, bind);
+      pass.dispatchWorkgroups(wgX, wgY);
+      pass.end();
+    }
+    device.queue.submit([enc0.finish()]);
+    const w = performance.now(); wgpuMs += w - b;
+
     inBuf.destroy(); // ownership -> WebNN
-    const c = performance.now(); destInMs += c - b;
+    const c = performance.now(); destInMs += c - w;
 
     mlContext.dispatch(mlGraph, { input: inputTensor }, { output: outputTensor });
     const d = performance.now(); dispMs += d - c;
@@ -630,6 +694,7 @@ async function measureInterop(reps) {
   const gpuWaitMs = performance.now() - tSubmit;
   return {
     expInMs: expInMs / reps,
+    wgpuMs: wgpuMs / reps,
     destInMs: destInMs / reps,
     dispMs: dispMs / reps,
     expOutMs: expOutMs / reps,
@@ -650,27 +715,25 @@ async function runLoop() {
     try {
       if (measure === 'interop') {
         await ensureResources(profile);
-        const m = await measureInterop(INTEROP_REPS);
+        const m = await measureInterop(INTEROP_REPS, profile);
 
         frames++;
-        expInSum += m.expInMs; destInSum += m.destInMs; dispSum += m.dispMs;
+        expInSum += m.expInMs; wgpuSum += m.wgpuMs; destInSum += m.destInMs; dispSum += m.dispMs;
         expOutSum += m.expOutMs; destOutSum += m.destOutMs; gpuWaitSum += m.gpuWaitMs;
         const now = performance.now();
         if (now - lastFpsTime >= 500) {
           const eIn = (expInSum / frames) * 1000;
+          const wgp = (wgpuSum / frames) * 1000;
           const dIn = (destInSum / frames) * 1000;
           const dsp = (dispSum / frames) * 1000;
           const eOut = (expOutSum / frames) * 1000;
           const dOut = (destOutSum / frames) * 1000;
           const gpu = (gpuWaitSum / frames) * 1000;
-          const total = eIn + dIn + dsp + eOut + dOut + gpu;
-          setChip('expIn', eIn); setChip('destIn', dIn); setChip('disp', dsp);
+          const total = eIn + wgp + dIn + dsp + eOut + dOut + gpu;
+          setChip('expIn', eIn); setChip('wgpu', wgp); setChip('destIn', dIn); setChip('disp', dsp);
           setChip('expOut', eOut); setChip('destOut', dOut); setChip('gpuWait', gpu);
-          $('spanLabel').textContent = `Interop cycle = ${total.toFixed(0)} µs (×${INTEROP_REPS})`;
-          $('fps').textContent =
-            `${total.toFixed(0)} µs/cyc = export ${(eIn + eOut).toFixed(0)} · ` +
-            `destroy ${(dIn + dOut).toFixed(0)} · dispatch ${dsp.toFixed(0)} · GPU-wait ${gpu.toFixed(0)} (×${INTEROP_REPS})`;
-          frames = 0; expInSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
+          $('spanLabel').textContent = `Interop cycle = ${total.toFixed(0)} µs (×${INTEROP_REPS}) · Tiles ${geom.numTiles}`;
+          frames = 0; expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
         }
       } else if (srcVideo.readyState >= 2 && srcVideo.videoWidth > 0) {
         await ensureResources(profile);
@@ -693,14 +756,12 @@ async function runLoop() {
         if (now - lastFpsTime >= 500) {
           if (flush === 'on') {
             const avgMs = frameTimeSum / frames;
-            $('fps').textContent =
-              `${avgMs.toFixed(2)} ms/frame (flush) · ${geom.numTiles} tiles/frame`;
-            $('spanLabel').textContent = `Full frame = ${avgMs.toFixed(2)} ms/frame (flush)`;
+            $('spanLabel').textContent =
+              `Full frame = ${avgMs.toFixed(2)} ms/frame (flush) · Tiles ${geom.numTiles}`;
           } else {
             const fps = (frames * 1000) / (now - lastFpsTime);
-            $('fps').textContent =
-              `${fps.toFixed(1)} fps (rAF, pipelined) · ${geom.numTiles} tiles/frame`;
-            $('spanLabel').textContent = `Full frame = ${fps.toFixed(1)} fps (rAF, pipelined)`;
+            $('spanLabel').textContent =
+              `Full frame = ${fps.toFixed(1)} fps (rAF, pipelined) · Tiles ${geom.numTiles}`;
           }
           frames = 0; frameTimeSum = 0; lastFpsTime = now;
         }
@@ -743,7 +804,7 @@ async function start() {
     running = true;
     $('stopBtn').disabled = false;
     lastFpsTime = performance.now(); frames = 0; frameTimeSum = 0;
-    expInSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0;
+    expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0;
     renderPipelineDiagram();
     log('Running (measuring per-frame latency).', 'ok');
     runLoop();
@@ -761,7 +822,7 @@ function stop() {
   stopSource();
   $('startBtn').disabled = false;
   $('stopBtn').disabled = true;
-  $('fps').textContent = '';
+  renderPipelineDiagram();
   log('Stopped.');
 }
 
@@ -774,22 +835,30 @@ const CHIP_META = {
   video:   'Video\nframe',
   import:  'import\next texture',
   expIn:   'exportToGPU\n(input)',
-  pre:     'preprocess\ncompute',
-  destIn:  'destroy\n(input)',
-  disp:    'WebNN\ndispatch',
+  wgpu:    'WebGPU dispatch\n(pass-through)',
+  pre:     'WebGPU dispatch\n(pre-process)',
+  destIn:  'import\n(input)',
+  disp:    'WebNN dispatch\n(pass-through)',
   expOut:  'exportToGPU\n(output)',
-  render:  'render',
-  destOut: 'destroy\n(output)',
+  render:  'WebGPU render\n(post-process)',
+  destOut: 'import\n(output)',
   present: 'present',
   gpuWait: 'completion\n(GPU-wait)',
 };
 const PIPELINE_STAGES = {
-  interop: ['expIn', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
+  interop: ['expIn', 'wgpu', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
   full:    ['video', 'import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
 };
+// A "stage" is actual dispatch/compute work; exportToGPU/import chips are just
+// ownership handoffs (and video/present/completion are I/O), so they don't count.
+const COMPUTE_STAGES = new Set(['wgpu', 'pre', 'disp', 'render']);
 function setChip(key, us) {
   const el = document.getElementById('val-' + key);
   if (el) el.textContent = `${us.toFixed(0)} µs`;
+}
+function getResolution() {
+  const [w, h] = $('resSel').value.split('x').map(Number);
+  return { w, h };
 }
 function renderPipelineDiagram() {
   const mode = $('measureSel').value;
@@ -808,20 +877,34 @@ function renderPipelineDiagram() {
       chips.appendChild(ar);
     }
   });
-  $('spanLabel').textContent = mode === 'interop'
+  const computeCount = stages.filter((k) => COMPUTE_STAGES.has(k)).length;
+  $('pipelineTitle').textContent = `Per-frame pipeline (${computeCount} compute stages)`;
+  const tiles = geom ? ` · Tiles ${geom.numTiles}` : '';
+  $('spanLabel').textContent = (mode === 'interop'
     ? 'Interop cycle — measured span'
-    : 'Full frame — measured span';
+    : 'Full frame — measured span') + tiles;
 }
 
 // =============================================================================
 // UI wiring.
 // =============================================================================
-$('sourceSel').addEventListener('change', () => {
-  $('fileInput').style.display = $('sourceSel').value === 'file' ? '' : 'none';
-});
-$('measureSel').addEventListener('change', renderPipelineDiagram);
+function updateSourceUI() {
+  const src = $('sourceSel').value;
+  $('fileInput').style.display = src === 'file' ? '' : 'none';
+  // Resolution only applies to the synthetic source; camera / file use native size.
+  $('resSel').disabled = src !== 'synthetic';
+}
+// Flush only affects the full pipeline; interop-only always drains once per batch.
+function updateMeasureUI() {
+  $('flushSel').disabled = $('measureSel').value !== 'full';
+}
+$('sourceSel').addEventListener('change', updateSourceUI);
+$('measureSel').addEventListener('change', () => { updateMeasureUI(); renderPipelineDiagram(); });
+$('resSel').addEventListener('change', () => { geom = null; });
 $('startBtn').addEventListener('click', start);
 $('stopBtn').addEventListener('click', stop);
+updateSourceUI();
+updateMeasureUI();
 renderPipelineDiagram();
 
 log('Ready. Requires a Chromium build with WebNN + WebGPU exportable-tensor interop enabled.');
