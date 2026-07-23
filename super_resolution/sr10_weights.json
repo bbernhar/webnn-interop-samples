@@ -1,0 +1,82 @@
+{
+  "dtype": "float32",
+  "total": 59657,
+  "tensors": [
+    {
+      "name": "conv1.weight",
+      "shape": [
+        64,
+        1,
+        5,
+        5
+      ],
+      "offset": 0,
+      "count": 1600
+    },
+    {
+      "name": "conv1.bias",
+      "shape": [
+        64
+      ],
+      "offset": 1600,
+      "count": 64
+    },
+    {
+      "name": "conv2.weight",
+      "shape": [
+        64,
+        64,
+        3,
+        3
+      ],
+      "offset": 1664,
+      "count": 36864
+    },
+    {
+      "name": "conv2.bias",
+      "shape": [
+        64
+      ],
+      "offset": 38528,
+      "count": 64
+    },
+    {
+      "name": "conv3.weight",
+      "shape": [
+        32,
+        64,
+        3,
+        3
+      ],
+      "offset": 38592,
+      "count": 18432
+    },
+    {
+      "name": "conv3.bias",
+      "shape": [
+        32
+      ],
+      "offset": 57024,
+      "count": 32
+    },
+    {
+      "name": "conv4.weight",
+      "shape": [
+        9,
+        32,
+        3,
+        3
+      ],
+      "offset": 57056,
+      "count": 2592
+    },
+    {
+      "name": "conv4.bias",
+      "shape": [
+        9
+      ],
+      "offset": 59648,
+      "count": 9
+    }
+  ]
+}
