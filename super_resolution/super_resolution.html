@@ -916,7 +916,10 @@ function updateSourceUI() {
 }
 // Flush only affects the full pipeline; interop-only always drains once per batch.
 function updateMeasureUI() {
-  $('flushSel').disabled = $('measureSel').value !== 'full';
+  const isFull = $('measureSel').value === 'full';
+  $('flushSel').disabled = !isFull;
+  // Interop-only never touches the video source or canvas, so hide those boxes.
+  $('stage').style.display = isFull ? '' : 'none';
 }
 $('sourceSel').addEventListener('change', updateSourceUI);
 $('measureSel').addEventListener('change', () => { updateMeasureUI(); renderPipelineDiagram(); });
