@@ -1605,6 +1605,10 @@ syncURLFromConfig();
 
 // Report whether WebGPU and WebNN are actually enabled at runtime (not just
 // present) so a customer immediately sees if the required flags are missing.
+function disableStart(reason) {
+  $('startBtn').disabled = true;
+  $('startBtn').title = reason;
+}
 async function reportStatus() {
   const gpuOk = !!navigator.gpu;
   log(`WebGPU: ${gpuOk ? 'available' : 'NOT available (navigator.gpu missing)'}`,
@@ -1613,21 +1617,44 @@ async function reportStatus() {
   if (!navigator.ml) {
     log('WebNN: NOT enabled \u2014 navigator.ml missing. Launch Chromium with ' +
         '--enable-features=WebMachineLearningNeuralNetwork', 'err');
-    $('startBtn').disabled = true;
-    $('startBtn').title = 'WebNN is not enabled. Launch Chromium with ' +
-        '--enable-features=WebMachineLearningNeuralNetwork';
+    disableStart('WebNN is not enabled. Launch Chromium with ' +
+        '--enable-features=WebMachineLearningNeuralNetwork');
     return;
   }
   try {
     // createContext only succeeds when WebNN is genuinely enabled/usable.
     await navigator.ml.createContext();
     log('WebNN: enabled (navigator.ml present, createContext succeeded).', 'ok');
+  } catch (e) {
+    log(`WebNN: present but not usable \u2014 ${e.name}: ${e.message}`, 'err');
+    disableStart(`WebNN context creation failed: ${e.name}: ${e.message}`);
+    return;
+  }
+
+  // Probe exportable-tensor interop: create an MLContext bound to a WebGPU
+  // device, allocate an exportable tensor, and export it to a GPUBuffer. This is
+  // the actual capability the benchmark depends on, so gate Start on it.
+  if (!gpuOk) {
+    log('WebNN interop: cannot probe (WebGPU unavailable).', 'err');
+    disableStart('WebGPU is unavailable, so WebNN <-> WebGPU interop cannot run.');
+    return;
+  }
+  try {
+    const probeAdapter = await navigator.gpu.requestAdapter();
+    if (!probeAdapter) throw new Error('no WebGPU adapter');
+    const probeDevice = await probeAdapter.requestDevice();
+    const probeCtx = await navigator.ml.createContext({ deviceType: 'gpu' });
+    const probe = await probeCtx.createExportableTensor(
+      { dataType: 'float32', shape: [1] }, probeDevice);
+    probeCtx.exportToGPU(probe);
+    probe.destroy();
+    probeDevice.destroy();
+    log('WebNN interop: enabled (createExportableTensor + exportToGPU succeeded).', 'ok');
     $('startBtn').disabled = false;
     $('startBtn').title = '';
   } catch (e) {
-    log(`WebNN: present but not usable \u2014 ${e.name}: ${e.message}`, 'err');
-    $('startBtn').disabled = true;
-    $('startBtn').title = `WebNN context creation failed: ${e.name}: ${e.message}`;
+    log(`WebNN interop: NOT available \u2014 ${e.name}: ${e.message}`, 'err');
+    disableStart(`WebNN <-> WebGPU exportable-tensor interop unavailable: ${e.name}: ${e.message}`);
   }
 }
 
