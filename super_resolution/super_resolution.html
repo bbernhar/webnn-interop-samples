@@ -157,6 +157,7 @@
     <input type="file" id="fileInput" accept="video/*" style="display:none">
     <button id="startBtn">Start</button>
     <button id="stopBtn" disabled>Stop</button>
+    <button id="copyLinkBtn" title="Copy a shareable URL that reproduces the current configuration">Copy link</button>
     <span id="resInfo" class="stat"></span>
   </div>
 
@@ -1546,13 +1547,71 @@ srcVideo.addEventListener('loadedmetadata', () => { updateProfileLabels(); updat
 srcVideo.addEventListener('resize', () => { updateProfileLabels(); updateResolutionInfo(); });
 $('startBtn').addEventListener('click', start);
 $('stopBtn').addEventListener('click', stop);
+
+// -----------------------------------------------------------------------------
+// Shareable config via URL query params: every control is encoded so a link
+// reproduces an exact workload. `?autostart=1` also begins the run on load, so
+// you can send a customer a URL that runs their specified configuration.
+// -----------------------------------------------------------------------------
+const URL_PARAMS = {
+  model:      'profileSel',
+  device:     'deviceSel',
+  adapter:    'gpuSel',
+  pipeline:   'pipelineSel',
+  webnn:      'dispatchSel',
+  completion: 'flushSel',
+  wgpu:       'wgpuStageSel',
+  res:        'resSel',
+  source:     'sourceSel',
+};
+function applyConfigFromURL() {
+  const q = new URLSearchParams(location.search);
+  for (const [key, id] of Object.entries(URL_PARAMS)) {
+    const val = q.get(key);
+    if (val == null) continue;
+    const el = $(id);
+    if (el && [...el.options].some((o) => o.value === val)) el.value = val;
+  }
+}
+function syncURLFromConfig() {
+  const q = new URLSearchParams();
+  for (const [key, id] of Object.entries(URL_PARAMS)) q.set(key, $(id).value);
+  const auto = new URLSearchParams(location.search).get('autostart');
+  if (auto != null) q.set('autostart', auto);
+  history.replaceState(null, '', `${location.pathname}?${q.toString()}`);
+}
+for (const id of Object.values(URL_PARAMS)) {
+  $(id).addEventListener('change', syncURLFromConfig);
+}
+$('copyLinkBtn').addEventListener('click', async () => {
+  syncURLFromConfig();
+  try {
+    await navigator.clipboard.writeText(location.href);
+    log('Config URL copied to clipboard.', 'ok');
+  } catch {
+    log('Copy failed; copy the address-bar URL manually.', 'err');
+  }
+});
+
+const wantAutostart = /^(1|true|yes)$/i.test(
+  new URLSearchParams(location.search).get('autostart') || '');
+applyConfigFromURL();
 updateSourceUI();
 updateDispatchUI();
 updateProfileLabels();
 renderPipelineDiagram();
+syncURLFromConfig();
 
 log('Ready. Requires a Chromium build with WebNN + WebGPU exportable-tensor interop enabled.');
 log('Tip: launch with --enable-features=WebMachineLearningNeuralNetwork and WebGPU enabled.');
+
+if (wantAutostart) {
+  if ($('pipelineSel').value !== 'interop' && $('sourceSel').value === 'file') {
+    log('autostart skipped: the local-file source needs a manual file selection.', 'err');
+  } else {
+    start();
+  }
+}
 </script>
 </body>
 </html>
