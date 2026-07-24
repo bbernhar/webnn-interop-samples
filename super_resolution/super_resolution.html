@@ -26,6 +26,7 @@
   select, button, input[type=file] { font-size: 13px; padding: 6px 8px; }
   select:disabled { opacity: 0.45; cursor: not-allowed; }
   button { cursor: pointer; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
   #stage { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
   figure { margin: 0; }
   figcaption { font-size: 12px; color: #9aa0a6; margin-bottom: 4px; }
@@ -1602,8 +1603,36 @@ updateProfileLabels();
 renderPipelineDiagram();
 syncURLFromConfig();
 
+// Report whether WebGPU and WebNN are actually enabled at runtime (not just
+// present) so a customer immediately sees if the required flags are missing.
+async function reportStatus() {
+  const gpuOk = !!navigator.gpu;
+  log(`WebGPU: ${gpuOk ? 'available' : 'NOT available (navigator.gpu missing)'}`,
+      gpuOk ? 'ok' : 'err');
+
+  if (!navigator.ml) {
+    log('WebNN: NOT enabled \u2014 navigator.ml missing. Launch Chromium with ' +
+        '--enable-features=WebMachineLearningNeuralNetwork', 'err');
+    $('startBtn').disabled = true;
+    $('startBtn').title = 'WebNN is not enabled. Launch Chromium with ' +
+        '--enable-features=WebMachineLearningNeuralNetwork';
+    return;
+  }
+  try {
+    // createContext only succeeds when WebNN is genuinely enabled/usable.
+    await navigator.ml.createContext();
+    log('WebNN: enabled (navigator.ml present, createContext succeeded).', 'ok');
+    $('startBtn').disabled = false;
+    $('startBtn').title = '';
+  } catch (e) {
+    log(`WebNN: present but not usable \u2014 ${e.name}: ${e.message}`, 'err');
+    $('startBtn').disabled = true;
+    $('startBtn').title = `WebNN context creation failed: ${e.name}: ${e.message}`;
+  }
+}
+
 log('Ready. Requires a Chromium build with WebNN + WebGPU exportable-tensor interop enabled.');
-log('Tip: launch with --enable-features=WebMachineLearningNeuralNetwork and WebGPU enabled.');
+reportStatus();
 
 if (wantAutostart) {
   if ($('pipelineSel').value !== 'interop' && $('sourceSel').value === 'file') {
