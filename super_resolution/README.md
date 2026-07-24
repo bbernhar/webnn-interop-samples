@@ -20,10 +20,11 @@ This sample benchmarks WebNN and WebGPU zero-copy interop using a super resoluti
 
 ## Run
 
-1. Open `super_resolution.html` in Chromium (or serve this folder statically).
-2. Select model format, WebNN device, GPU adapter, and measurement mode.
-3. For full pipeline modes, select a source (synthetic, camera, or local video).
-4. Click Start.
+1. Open the hosted page: https://bbernhar.github.io/webnn-interop-samples/super_resolution/super_resolution.html
+2. Or run a local static server and open `http://.../super_resolution.html`.
+3. Select model format, WebNN device, GPU adapter, and measurement mode.
+4. For full pipeline modes, select a source (synthetic, camera, or local video).
+5. Click Start.
 
 ## Real SR model (ESPCN)
 
@@ -39,7 +40,9 @@ initializers into:
 - `sr10_weights.bin` - raw little-endian float32, concatenated.
 - `sr10_weights.json` - manifest (name / shape / offset / count).
 
-The page fetches both at runtime. To regenerate them from the source model:
+When loaded over HTTP/HTTPS (including GitHub Pages), the page fetches both at
+runtime from the same folder as the HTML. To regenerate them from the source
+model:
 
 ```
 py -m pip install onnx numpy

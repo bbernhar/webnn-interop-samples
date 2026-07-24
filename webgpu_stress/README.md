@@ -19,9 +19,10 @@ This sample stress-tests WebGPU rendering with scalable storage-buffer pressure 
 
 ## Run
 
-1. Open `webgpu_stress.html` in a WebGPU-capable Chromium build.
-2. Click Start Stress.
-3. Increase or decrease the stress slider to change memory pressure.
+1. Open the hosted page: https://bbernhar.github.io/webnn-interop-samples/webgpu_stress/webgpu_stress.html
+2. Or run a local static server and open `http://.../webgpu_stress.html`.
+3. Click Start Stress.
+4. Increase or decrease the stress slider to change memory pressure.
 
 ## Notes
 
