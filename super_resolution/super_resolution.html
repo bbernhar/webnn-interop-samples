@@ -124,10 +124,11 @@
         <option value="sr">ESPCN SR</option>
       </select>
     </label>
-    <label title="Full pipeline only: wait for each frame to complete (onSubmittedWorkDone) to measure serialized per-frame latency, or skip the wait and pace with requestAnimationFrame to allow pipelining (reports throughput/FPS)">Frame completion
+    <label title="Full pipeline only: choose serialized per-frame flush, rAF pacing, or no rAF mode.">Frame completion
       <select id="flushSel">
         <option value="on" selected>Serialized (per-frame flush)</option>
         <option value="off">Pipelined (rAF)</option>
+        <option value="offline">No rAF</option>
       </select>
     </label>
     <label title="Full pipeline only: selectively bypass WebGPU preprocess and/or render stages for A/B timing.">WebGPU stages
@@ -292,6 +293,7 @@ const outCanvas = $('outCanvas');
 let frames = 0, frameTimeSum = 0, lastFpsTime = 0;
 // Interop-only per-call accumulators (per cycle, ms).
 let expInSum = 0, wgpuSum = 0, expOutSum = 0, destInSum = 0, destOutSum = 0, dispSum = 0, gpuWaitSum = 0;
+let offlineYieldCounter = 0;
 let lastNonSrProfile = 'C';
 
 // =============================================================================
@@ -1154,7 +1156,7 @@ async function runLoop() {
         const isSR = dispatchMode === 'sr';
         if (isSR) await ensureSRResources();
         else await ensureResources(profile);
-        const flush = $('flushSel').value; // 'on' = onSubmittedWorkDone, 'off' = rAF-paced
+        const flush = $('flushSel').value; // 'on' = onSubmittedWorkDone, 'off' = rAF-paced, 'offline' = no rAF pacing
         const t0 = performance.now();
         const metrics = isSR ? processFrameSR() : processFrame(profile);
         if (flush === 'on') {
@@ -1162,12 +1164,27 @@ async function runLoop() {
           const tw0 = performance.now();
           await device.queue.onSubmittedWorkDone();
           metrics.ioMs += performance.now() - tw0;
-        } else {
+        } else if (flush === 'off') {
           // No flush: pace on the next animation frame so the pipeline can
           // overlap frames (present happens naturally) -> throughput.
           const tr0 = performance.now();
           await new Promise((r) => requestAnimationFrame(() => r()));
           metrics.ioMs += performance.now() - tr0;
+        } else {
+          // Offline: no rAF pacing and no explicit per-frame flush.
+          // Lets the loop run unpaced to measure intrinsic pipeline throughput.
+          // Periodically wait for GPU completion so the queue doesn't grow
+          // without bound and measurements remain visible/stable.
+          // Periodically yield so UI/input/log rendering can make progress.
+          offlineYieldCounter++;
+          if ((offlineYieldCounter & 7) === 0) {
+            const tw0 = performance.now();
+            await device.queue.onSubmittedWorkDone();
+            metrics.ioMs += performance.now() - tw0;
+          }
+          if ((offlineYieldCounter & 31) === 0) {
+            await new Promise((r) => setTimeout(r, 0));
+          }
         }
         const dt = performance.now() - t0;
 
@@ -1180,10 +1197,14 @@ async function runLoop() {
             const avgMs = frameTimeSum / frames;
             $('spanLabel').textContent =
               `${label} = ${avgMs.toFixed(2)} ms/frame (flush)`;
-          } else {
+          } else if (flush === 'off') {
             const fps = (frames * 1000) / (now - lastFpsTime);
             $('spanLabel').textContent =
               `${label} = ${fps.toFixed(1)} fps (rAF, pipelined)`;
+          } else {
+            const fps = (frames * 1000) / (now - lastFpsTime);
+            $('spanLabel').textContent =
+                `${label} = ${fps.toFixed(1)} fps (no rAF)`;
           }
           frames = 0; frameTimeSum = 0; lastFpsTime = now;
         }
@@ -1240,6 +1261,7 @@ async function start() {
     $('stopBtn').disabled = false;
     lastFpsTime = performance.now(); frames = 0; frameTimeSum = 0;
     expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0;
+    offlineYieldCounter = 0;
     updateTotalsInfo();
     renderPipelineDiagram();
     log('Running (measuring per-frame latency).', 'ok');
