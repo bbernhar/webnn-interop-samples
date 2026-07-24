@@ -1475,7 +1475,7 @@ function renderPipelineDiagram() {
   const computeCount = stages.filter((k) => COMPUTE_STAGES.has(k)).length;
   $('pipelineTitle').textContent = `Per-frame pipeline (${computeCount} compute stages)`;
   const spanPrefix = modeKey === 'interop' ? 'Interop cycle' : 'Full frame';
-  $('spanLabel').textContent = `${spanPrefix} \u2014 measured span`;
+  $('spanLabel').textContent = spanPrefix;
   updateTotalsInfo();
 }
 
