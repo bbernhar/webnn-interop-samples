@@ -1321,7 +1321,7 @@ function stop() {
 // =============================================================================
 const CHIP_META = {
   video:   'Video\nframe',
-  import:  'import\next texture',
+  import:  'importExternalTexture',
   expIn:   'exportToGPU\n(input)',
   wgpu:    'WebGPU compute\n(pass-through)',
   pre:     'WebGPU compute\n(pre-process)',
@@ -1336,7 +1336,7 @@ const CHIP_META = {
 };
 const CHIP_CONV = {
   video: 'decoded frame',
-  import: 'VideoFrame -> ext tex',
+  import: 'VideoFrame -> GPUExternalTexture',
   expIn: 'MLTensor -> GPUBuffer',
   wgpu: 'in-place write',
   pre: 'RGB -> BGR + tile pack',
