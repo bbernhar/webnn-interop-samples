@@ -61,7 +61,6 @@
   .chip.domain-webnn { border-color: #3fbf7f; background: #13281f; }
   .chip.domain-transfer { border-color: #f2ad4f; background: #2d2313; }
   .chip.domain-io { border-color: #7d8692; background: #1d2127; }
-  .chip.inactive { opacity: 0.28; filter: grayscale(1); }
   .chip .name { font-size: 13px; color: #cdd2d7; white-space: pre-line; line-height: 1.2; }
   .chip .conv { font-size: 12px; color: #9aa0a6; margin-top: 5px; white-space: pre-line; line-height: 1.15; min-height: 28px; }
   .chip .val { font-size: 15px; font-variant-numeric: tabular-nums; color: #a5d6a7; margin-top: 6px; min-height: 19px; }
@@ -313,6 +312,8 @@ let frames = 0, frameTimeSum = 0, lastFpsTime = 0;
 let cumFrames = 0, cumTimeSum = 0, runStart = 0;
 // Interop-only per-call accumulators (per cycle, ms).
 let expInSum = 0, wgpuSum = 0, expOutSum = 0, destInSum = 0, destOutSum = 0, dispSum = 0, gpuWaitSum = 0;
+// Cumulative (whole-run) interop accumulators for a stable, converging average.
+let cExpIn = 0, cWgpu = 0, cExpOut = 0, cDestIn = 0, cDestOut = 0, cDisp = 0, cGpuWait = 0;
 let offlineYieldCounter = 0;
 let lastNonSrProfile = 'C';
 
@@ -1169,8 +1170,12 @@ async function runLoop() {
         frames++;
         expInSum += m.expInMs; wgpuSum += m.wgpuMs; destInSum += m.destInMs; dispSum += m.dispMs;
         expOutSum += m.expOutMs; destOutSum += m.destOutMs; gpuWaitSum += m.gpuWaitMs;
+        cumFrames++;
+        cExpIn += m.expInMs; cWgpu += m.wgpuMs; cDestIn += m.destInMs; cDisp += m.dispMs;
+        cExpOut += m.expOutMs; cDestOut += m.destOutMs; cGpuWait += m.gpuWaitMs;
         const now = performance.now();
         if (now - lastFpsTime >= 500) {
+          // Current (bouncy) per-window averages.
           const eIn = (expInSum / frames) * 1000;
           const wgp = (wgpuSum / frames) * 1000;
           const dIn = (destInSum / frames) * 1000;
@@ -1179,11 +1184,22 @@ async function runLoop() {
           const dOut = (destOutSum / frames) * 1000;
           const gpu = (gpuWaitSum / frames) * 1000;
           const total = eIn + wgp + dIn + dsp + eOut + dOut + gpu;
-          const transferSum = eIn + dIn + eOut + dOut;
-          setChip('expIn', eIn); setChip('pre', wgp); setChip('destIn', dIn); setChip('disp', dsp);
-          setChip('expOut', eOut); setChip('destOut', dOut);
-          $('spanLabel').textContent = `Iteration = ${total.toFixed(0)} µs (×${INTEROP_REPS})`;
-          updateTotalsInfo({ webgpuUs: wgp, webnnUs: dsp, transferUs: transferSum, ioUs: gpu });
+          // Cumulative (whole-run) averages: stable / converging.
+          const aeIn = (cExpIn / cumFrames) * 1000;
+          const awgp = (cWgpu / cumFrames) * 1000;
+          const adIn = (cDestIn / cumFrames) * 1000;
+          const adsp = (cDisp / cumFrames) * 1000;
+          const aeOut = (cExpOut / cumFrames) * 1000;
+          const adOut = (cDestOut / cumFrames) * 1000;
+          const agpu = (cGpuWait / cumFrames) * 1000;
+          const avgTotal = aeIn + awgp + adIn + adsp + aeOut + adOut + agpu;
+          const transferSum = aeIn + adIn + aeOut + adOut;
+          // Chips show the stable cumulative averages.
+          setChip('expIn', aeIn); setChip('wgpu', awgp); setChip('destIn', adIn); setChip('disp', adsp);
+          setChip('expOut', aeOut); setChip('destOut', adOut); setChip('gpuWait', agpu);
+          $('spanLabel').textContent =
+            `Iteration = ${(avgTotal / 1000).toFixed(3)} ms (avg) · ${(total / 1000).toFixed(3)} ms (current) (×${INTEROP_REPS})`;
+          updateTotalsInfo({ webgpuUs: awgp, webnnUs: adsp, transferUs: transferSum, ioUs: agpu });
           frames = 0; expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
         }
       } else if (srcVideo.readyState >= 2 && srcVideo.videoWidth > 0) {
@@ -1301,6 +1317,7 @@ async function start() {
     lastFpsTime = performance.now(); frames = 0; frameTimeSum = 0;
     cumFrames = 0; cumTimeSum = 0; runStart = performance.now();
     expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0;
+    cExpIn = 0; cWgpu = 0; cDestIn = 0; cDisp = 0; cExpOut = 0; cDestOut = 0; cGpuWait = 0;
     offlineYieldCounter = 0;
     updateTotalsInfo();
     renderPipelineDiagram();
@@ -1360,15 +1377,9 @@ const CHIP_CONV = {
   gpuWait: 'queue drain wait',
 };
 const PIPELINE_STAGES = {
+  interop: ['expIn', 'wgpu', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
   pass:    ['video', 'import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
   sr:      ['video', 'import', 'expIn', 'pre', 'destIn', 'dispSR', 'expOut', 'render', 'destOut', 'present'],
-};
-// Interop-only reuses the full passthrough layout but greys out the stages it
-// never runs (no video import, render, or present), and relabels the WebGPU
-// compute chip to reflect the in-place buffer touch it does instead of preprocess.
-const INTEROP_INACTIVE = new Set(['video', 'import', 'render', 'present']);
-const INTEROP_OVERRIDE = {
-  pre: { name: 'WebGPU compute\n(in-place)', conv: 'in-place write' },
 };
 const STAGE_DOMAIN = {
   video: 'io',
@@ -1538,9 +1549,9 @@ function renderPipelineDiagram() {
   const pipelineMode = $('pipelineSel').value;
   const dispatchMode = $('dispatchSel').value;
   const isInterop = pipelineMode === 'interop';
-  // Interop reuses the full passthrough layout (greying unused chips) so the
-  // diagram doesn't reshuffle when switching modes.
-  const modeKey = isInterop ? 'pass' : dispatchMode;
+  // Interop has its own pipeline (handshake micro-benchmark); full / SR share the
+  // video pipeline layout.
+  const modeKey = isInterop ? 'interop' : dispatchMode;
   const stages = [...(PIPELINE_STAGES[modeKey] || PIPELINE_STAGES.pass)];
   if (pipelineMode !== 'interop') {
     if (!isFullPreprocessEnabled()) {
@@ -1563,13 +1574,9 @@ function renderPipelineDiagram() {
   const chips = $('chips');
   chips.innerHTML = '';
   stages.forEach((key, i) => {
-    const inactive = isInterop && INTEROP_INACTIVE.has(key);
     const chip = document.createElement('div');
-    chip.className = `chip domain-${STAGE_DOMAIN[key] || 'io'}${inactive ? ' inactive' : ''}`;
-    const override = isInterop ? INTEROP_OVERRIDE[key] : null;
-    const name = override ? override.name : CHIP_META[key];
-    const conv = override ? override.conv : (CHIP_CONV[key] || '');
-    chip.innerHTML = `<div class="name">${name}</div><div class="conv">${conv}</div><div class="val" id="val-${key}"></div>`;
+    chip.className = `chip domain-${STAGE_DOMAIN[key] || 'io'}`;
+    chip.innerHTML = `<div class="name">${CHIP_META[key]}</div><div class="conv">${CHIP_CONV[key] || ''}</div><div class="val" id="val-${key}"></div>`;
     chips.appendChild(chip);
     if (i < stages.length - 1) {
       const ar = document.createElement('span');
@@ -1578,8 +1585,7 @@ function renderPipelineDiagram() {
       chips.appendChild(ar);
     }
   });
-  const computeCount = stages.filter(
-    (k) => COMPUTE_STAGES.has(k) && !(isInterop && INTEROP_INACTIVE.has(k))).length;
+  const computeCount = stages.filter((k) => COMPUTE_STAGES.has(k)).length;
   $('pipelineTitle').textContent = `Per-frame pipeline (${computeCount} compute stages)`;
   // Only show the span label while running; keep it blank when idle.
   const spanPrefix = isInterop
