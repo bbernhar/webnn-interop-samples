@@ -194,8 +194,8 @@
   </div>
 
   <div id="stage">
-    <figure>
-      <figcaption>Source (hidden video decode target)</figcaption>
+    <figure id="sourceFigure">
+      <figcaption>Source (decoded input)</figcaption>
       <video id="srcVideo" width="480" height="270" muted playsinline loop></video>
     </figure>
     <figure>
@@ -1575,6 +1575,9 @@ function updateSourceUI() {
   $('fileInput').style.display = src === 'file' ? '' : 'none';
   // Resolution only applies to the synthetic source; camera / file use native size.
   $('resSel').disabled = src !== 'synthetic';
+  // The Source preview is only informative for real inputs (camera / file); the
+  // synthetic test pattern is self-generated, so hide its (redundant) preview.
+  $('sourceFigure').style.display = src === 'synthetic' ? 'none' : '';
   updateResolutionInfo();
 }
 // Flush affects the full video pipeline for both dispatch choices.
