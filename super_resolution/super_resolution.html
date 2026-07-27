@@ -1212,19 +1212,18 @@ async function runLoop() {
         frameTimeSum += dt;
         const now = performance.now();
         if (now - lastFpsTime >= 500) {
-          const label = 'Full frame';
           if (flush === 'on') {
             const avgMs = frameTimeSum / frames;
             $('spanLabel').textContent =
-              `${label} = ${avgMs.toFixed(2)} ms/frame (flush)`;
+              `Frame time = ${avgMs.toFixed(2)} ms/frame (flush)`;
           } else if (flush === 'off') {
             const fps = (frames * 1000) / (now - lastFpsTime);
             $('spanLabel').textContent =
-              `${label} = ${fps.toFixed(1)} fps (rAF, pipelined)`;
+              `Frame rate = ${fps.toFixed(1)} fps (rAF, pipelined)`;
           } else {
             const fps = (frames * 1000) / (now - lastFpsTime);
             $('spanLabel').textContent =
-                `${label} = ${fps.toFixed(1)} fps (no rAF)`;
+                `Frame rate = ${fps.toFixed(1)} fps (no rAF)`;
           }
           frames = 0; frameTimeSum = 0; lastFpsTime = now;
         }
