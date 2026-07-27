@@ -148,7 +148,7 @@
         <option value="skip-both">Skip compute + render</option>
       </select>
     </label>
-    <label title="Input frame resolution for synthetic source. Camera and local file use native source resolution.">Source resolution
+    <label title="Input frame resolution for the test-pattern source. Camera and local file use native source resolution.">Source resolution
       <select id="resSel">
         <option value="640x360">640 &times; 360</option>
         <option value="1280x720" selected>1280 &times; 720</option>
@@ -158,7 +158,7 @@
     </label>
     <label>Source
       <select id="sourceSel">
-        <option value="synthetic" selected>Test pattern</option>
+        <option value="test" selected>Test pattern</option>
         <option value="camera">Camera</option>
         <option value="file">Local file…</option>
       </select>
@@ -1263,7 +1263,7 @@ async function start() {
     const pipelineMode = $('pipelineSel').value;
     if (pipelineMode !== 'interop') {
       const src = $('sourceSel').value;
-      if (src === 'synthetic') await startSyntheticSource();
+      if (src === 'test') await startSyntheticSource();
       else if (src === 'camera') await startCameraSource();
       else {
         const f = $('fileInput').files[0];
@@ -1407,7 +1407,7 @@ function formatResolution(w, h) {
 }
 function getActiveSourceResolution() {
   const src = $('sourceSel').value;
-  if (src === 'synthetic') {
+  if (src === 'test') {
     return getResolution();
   }
   if (srcVideo.videoWidth > 0 && srcVideo.videoHeight > 0) {
@@ -1421,7 +1421,7 @@ function updateResolutionInfo() {
   const src = $('sourceSel').value;
   const srcRes = getActiveSourceResolution();
   const srcText = srcRes ? formatResolution(srcRes.w, srcRes.h)
-    : (src === 'synthetic' ? 'unknown' : 'native (pending)');
+    : (src === 'test' ? 'unknown' : 'native (pending)');
 
   let targetText = srcText;
   if (pipelineMode === 'interop') {
@@ -1573,11 +1573,11 @@ function renderPipelineDiagram() {
 function updateSourceUI() {
   const src = $('sourceSel').value;
   $('fileInput').style.display = src === 'file' ? '' : 'none';
-  // Resolution only applies to the synthetic source; camera / file use native size.
-  $('resSel').disabled = src !== 'synthetic';
+  // Resolution only applies to the test-pattern source; camera / file use native size.
+  $('resSel').disabled = src !== 'test';
   // The Source preview is only informative for real inputs (camera / file); the
-  // synthetic test pattern is self-generated, so hide its (redundant) preview.
-  $('sourceFigure').style.display = src === 'synthetic' ? 'none' : '';
+  // test pattern is self-generated, so hide its (redundant) preview.
+  $('sourceFigure').style.display = src === 'test' ? 'none' : '';
   updateResolutionInfo();
 }
 // Model format and WebNN stages are two views of the same choice (SR model <->
