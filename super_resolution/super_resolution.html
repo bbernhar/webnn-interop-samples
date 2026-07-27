@@ -61,6 +61,7 @@
   .chip.domain-webnn { border-color: #3fbf7f; background: #13281f; }
   .chip.domain-transfer { border-color: #f2ad4f; background: #2d2313; }
   .chip.domain-io { border-color: #7d8692; background: #1d2127; }
+  .chip.inactive { opacity: 0.28; filter: grayscale(1); }
   .chip .name { font-size: 13px; color: #cdd2d7; white-space: pre-line; line-height: 1.2; }
   .chip .conv { font-size: 12px; color: #9aa0a6; margin-top: 5px; white-space: pre-line; line-height: 1.15; min-height: 28px; }
   .chip .val { font-size: 15px; font-variant-numeric: tabular-nums; color: #a5d6a7; margin-top: 6px; min-height: 19px; }
@@ -1148,8 +1149,8 @@ async function runLoop() {
           const gpu = (gpuWaitSum / frames) * 1000;
           const total = eIn + wgp + dIn + dsp + eOut + dOut + gpu;
           const transferSum = eIn + dIn + eOut + dOut;
-          setChip('expIn', eIn); setChip('wgpu', wgp); setChip('destIn', dIn); setChip('disp', dsp);
-          setChip('expOut', eOut); setChip('destOut', dOut); setChip('gpuWait', gpu);
+          setChip('expIn', eIn); setChip('pre', wgp); setChip('destIn', dIn); setChip('disp', dsp);
+          setChip('expOut', eOut); setChip('destOut', dOut);
           $('spanLabel').textContent = `Interop cycle = ${total.toFixed(0)} µs (×${INTEROP_REPS})`;
           updateTotalsInfo({ webgpuUs: wgp, webnnUs: dsp, transferUs: transferSum, ioUs: gpu });
           frames = 0; expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
@@ -1322,9 +1323,15 @@ const CHIP_CONV = {
   gpuWait: 'queue drain wait',
 };
 const PIPELINE_STAGES = {
-  interop: ['expIn', 'wgpu', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
   pass:    ['video', 'import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
   sr:      ['video', 'import', 'expIn', 'pre', 'destIn', 'dispSR', 'expOut', 'render', 'destOut', 'present'],
+};
+// Interop-only reuses the full passthrough layout but greys out the stages it
+// never runs (no video import, render, or present), and relabels the WebGPU
+// compute chip to reflect the in-place buffer touch it does instead of preprocess.
+const INTEROP_INACTIVE = new Set(['video', 'import', 'render', 'present']);
+const INTEROP_OVERRIDE = {
+  pre: { name: 'WebGPU compute\n(in-place)', conv: 'in-place write' },
 };
 const STAGE_DOMAIN = {
   video: 'io',
@@ -1439,7 +1446,10 @@ function updateProfileLabels() {
 function renderPipelineDiagram() {
   const pipelineMode = $('pipelineSel').value;
   const dispatchMode = $('dispatchSel').value;
-  const modeKey = pipelineMode === 'interop' ? 'interop' : dispatchMode;
+  const isInterop = pipelineMode === 'interop';
+  // Interop reuses the full passthrough layout (greying unused chips) so the
+  // diagram doesn't reshuffle when switching modes.
+  const modeKey = isInterop ? 'pass' : dispatchMode;
   const stages = [...(PIPELINE_STAGES[modeKey] || PIPELINE_STAGES.pass)];
   if (pipelineMode !== 'interop') {
     if (!isFullPreprocessEnabled()) {
@@ -1462,9 +1472,13 @@ function renderPipelineDiagram() {
   const chips = $('chips');
   chips.innerHTML = '';
   stages.forEach((key, i) => {
+    const inactive = isInterop && INTEROP_INACTIVE.has(key);
     const chip = document.createElement('div');
-    chip.className = `chip domain-${STAGE_DOMAIN[key] || 'io'}`;
-    chip.innerHTML = `<div class="name">${CHIP_META[key]}</div><div class="conv">${CHIP_CONV[key] || ''}</div><div class="val" id="val-${key}"></div>`;
+    chip.className = `chip domain-${STAGE_DOMAIN[key] || 'io'}${inactive ? ' inactive' : ''}`;
+    const override = isInterop ? INTEROP_OVERRIDE[key] : null;
+    const name = override ? override.name : CHIP_META[key];
+    const conv = override ? override.conv : (CHIP_CONV[key] || '');
+    chip.innerHTML = `<div class="name">${name}</div><div class="conv">${conv}</div><div class="val" id="val-${key}"></div>`;
     chips.appendChild(chip);
     if (i < stages.length - 1) {
       const ar = document.createElement('span');
@@ -1473,9 +1487,10 @@ function renderPipelineDiagram() {
       chips.appendChild(ar);
     }
   });
-  const computeCount = stages.filter((k) => COMPUTE_STAGES.has(k)).length;
+  const computeCount = stages.filter(
+    (k) => COMPUTE_STAGES.has(k) && !(isInterop && INTEROP_INACTIVE.has(k))).length;
   $('pipelineTitle').textContent = `Per-frame pipeline (${computeCount} compute stages)`;
-  const spanPrefix = modeKey === 'interop' ? 'Interop cycle' : 'Full frame';
+  const spanPrefix = isInterop ? 'Interop cycle' : 'Full frame';
   $('spanLabel').textContent = spanPrefix;
   updateTotalsInfo();
 }
