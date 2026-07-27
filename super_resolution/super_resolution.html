@@ -1168,7 +1168,7 @@ async function runLoop() {
           const transferSum = eIn + dIn + eOut + dOut;
           setChip('expIn', eIn); setChip('pre', wgp); setChip('destIn', dIn); setChip('disp', dsp);
           setChip('expOut', eOut); setChip('destOut', dOut);
-          $('spanLabel').textContent = `Interop cycle = ${total.toFixed(0)} µs (×${INTEROP_REPS})`;
+          $('spanLabel').textContent = `Iteration = ${total.toFixed(0)} µs (×${INTEROP_REPS})`;
           updateTotalsInfo({ webgpuUs: wgp, webnnUs: dsp, transferUs: transferSum, ioUs: gpu });
           frames = 0; expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
         }
@@ -1559,8 +1559,11 @@ function renderPipelineDiagram() {
   const computeCount = stages.filter(
     (k) => COMPUTE_STAGES.has(k) && !(isInterop && INTEROP_INACTIVE.has(k))).length;
   $('pipelineTitle').textContent = `Per-frame pipeline (${computeCount} compute stages)`;
-  const spanPrefix = isInterop ? 'Interop cycle' : 'Full frame';
-  $('spanLabel').textContent = spanPrefix;
+  // Only show the span label while running; keep it blank when idle.
+  const spanPrefix = isInterop
+    ? 'Iteration'
+    : ($('flushSel').value === 'on' ? 'Frame time' : 'Frame rate');
+  $('spanLabel').textContent = running ? spanPrefix : '';
   updateTotalsInfo();
 }
 
@@ -1609,6 +1612,7 @@ $('sourceSel').addEventListener('change', updateSourceUI);
 $('pipelineSel').addEventListener('change', () => { updateDispatchUI(); renderPipelineDiagram(); });
 $('dispatchSel').addEventListener('change', () => { updateDispatchUI(); renderPipelineDiagram(); });
 $('wgpuStageSel').addEventListener('change', () => { renderPipelineDiagram(); });
+$('flushSel').addEventListener('change', () => { renderPipelineDiagram(); });
 $('profileSel').addEventListener('change', () => {
   const p = $('profileSel').value;
   if (p !== 'SR') lastNonSrProfile = p;
