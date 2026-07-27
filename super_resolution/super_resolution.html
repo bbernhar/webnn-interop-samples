@@ -170,10 +170,7 @@
   </div>
 
   <div id="pipeline">
-    <div class="section-head">
-      <span class="pipeline-title" id="pipelineTitle">Per-frame pipeline</span>
-      <span id="resInfo" class="stat"></span>
-    </div>
+    <div class="pipeline-title" id="pipelineTitle">Per-frame pipeline</div>
     <div class="chips" id="chips"></div>
     <div class="spanbar"><span class="span-label" id="spanLabel"></span></div>
     <div class="legend">
@@ -199,7 +196,7 @@
       <video id="srcVideo" width="480" height="270" muted playsinline loop></video>
     </figure>
     <figure>
-      <figcaption>Output (WebNN dispatch result, rendered via WebGPU)</figcaption>
+      <figcaption>Output (WebNN result, WebGPU render) <span id="targetInfo" class="stat"></span></figcaption>
       <canvas id="outCanvas" width="1280" height="720"></canvas>
     </figure>
   </div>
@@ -1446,7 +1443,8 @@ function updateResolutionInfo() {
       : `${SR_UPSCALE}x source (pending)`;
   }
 
-  $('resInfo').textContent = `Source: ${srcText} | Target: ${targetText}`;
+  const targetEl = $('targetInfo');
+  if (targetEl) targetEl.textContent = `\u2192 ${targetText}`;
   renderTileViz();
 }
 // Tile size in effect for the selected Model format (SR uses a fixed 224 tile).
@@ -1499,7 +1497,7 @@ function renderTileViz() {
   const isSR = $('profileSel').value === 'SR';
   const batch = isSR ? ` \u00b7 batch ${numTiles * CHANNELS} (3\u00d7${numTiles} B/G/R planes)` : '';
   $('tileCaption').textContent =
-    `${frameW}\u00d7${frameH} frame \u2192 ${numTiles} tiles (${tilesX}\u00d7${tilesY}) of ${tw}\u00d7${th}${batch}`;
+    `${frameW}\u00d7${frameH} \u2192 ${numTiles} tiles (${tilesX}\u00d7${tilesY}) of ${tw}\u00d7${th}${batch}`;
 }
 // Rewrite the Model format option labels so the batch dim N shows the actual
 // tile count for the current frame size (native video size if playing, else the
