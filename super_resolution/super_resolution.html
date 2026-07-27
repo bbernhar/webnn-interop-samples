@@ -1639,7 +1639,7 @@ async function reportStatus() {
   try {
     // createContext only succeeds when WebNN is genuinely enabled/usable.
     await navigator.ml.createContext();
-    log('WebNN: enabled (navigator.ml present, createContext succeeded).', 'ok');
+    log('WebNN: available', 'ok');
   } catch (e) {
     log(`WebNN: present but not usable \u2014 ${e.name}: ${e.message}`, 'err');
     disableStart(`WebNN context creation failed: ${e.name}: ${e.message}`);
