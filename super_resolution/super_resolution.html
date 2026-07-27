@@ -1580,32 +1580,22 @@ function updateSourceUI() {
   $('sourceFigure').style.display = src === 'synthetic' ? 'none' : '';
   updateResolutionInfo();
 }
-// Flush affects the full video pipeline for both dispatch choices.
-// ESPCN uses fixed 224x224 tiling, so the passthrough profile selector is disabled.
+// Model format and WebNN stages are two views of the same choice (SR model <->
+// ESPCN SR dispatch). Keep both enabled in Full mode and sync them, rather than
+// disabling both (which would lock the user out). Interop is passthrough-only.
 function updateDispatchUI() {
-  const mode = $('dispatchSel').value;
   const isInterop = $('pipelineSel').value === 'interop';
-  const isSrProfile = $('profileSel').value === 'SR';
-  $('dispatchSel').disabled = isInterop || isSrProfile;
   $('flushSel').disabled = isInterop;
   $('wgpuStageSel').disabled = isInterop;
+  $('dispatchSel').disabled = isInterop;
+  $('profileSel').disabled = false;
 
   if (isInterop) {
+    // Interop runs a passthrough micro-benchmark; SR is not applicable.
     if ($('profileSel').value === 'SR') {
       $('profileSel').value = PROFILES[lastNonSrProfile] ? lastNonSrProfile : 'C';
     }
-    $('profileSel').disabled = false;
-  } else if (mode === 'sr') {
-    if ($('profileSel').value !== 'SR') {
-      lastNonSrProfile = $('profileSel').value;
-    }
-    $('profileSel').value = 'SR';
-    $('profileSel').disabled = true;
-  } else {
-    if ($('profileSel').value === 'SR') {
-      $('profileSel').value = PROFILES[lastNonSrProfile] ? lastNonSrProfile : 'C';
-    }
-    $('profileSel').disabled = false;
+    if ($('dispatchSel').value === 'sr') $('dispatchSel').value = 'pass';
   }
 
   $('stage').style.display = isInterop ? 'none' : '';
@@ -1613,27 +1603,38 @@ function updateDispatchUI() {
 }
 $('sourceSel').addEventListener('change', updateSourceUI);
 $('pipelineSel').addEventListener('change', () => { updateDispatchUI(); renderPipelineDiagram(); });
-$('dispatchSel').addEventListener('change', () => { updateDispatchUI(); renderPipelineDiagram(); });
+$('dispatchSel').addEventListener('change', () => {
+  // Sync the Model format to match: ESPCN SR <-> SR model, pass-through <-> A/B/C.
+  if ($('dispatchSel').value === 'sr') {
+    if ($('profileSel').value !== 'SR') lastNonSrProfile = $('profileSel').value;
+    $('profileSel').value = 'SR';
+  } else if ($('profileSel').value === 'SR') {
+    $('profileSel').value = PROFILES[lastNonSrProfile] ? lastNonSrProfile : 'C';
+  }
+  updateDispatchUI();
+  renderPipelineDiagram();
+  renderTileViz();
+});
 $('wgpuStageSel').addEventListener('change', () => { renderPipelineDiagram(); });
 $('flushSel').addEventListener('change', () => { renderPipelineDiagram(); });
 $('profileSel').addEventListener('change', () => {
   const p = $('profileSel').value;
   if (p !== 'SR') lastNonSrProfile = p;
-  const isInterop = $('pipelineSel').value === 'interop';
   if (p === 'SR') {
-    if (isInterop) {
+    if ($('pipelineSel').value === 'interop') {
       $('profileSel').value = PROFILES[lastNonSrProfile] ? lastNonSrProfile : 'C';
       log('Model format SR is not available in Interop mode. Switched back to a passthrough profile.');
       renderTileViz();
       return;
     }
-    if ($('dispatchSel').value !== 'sr') {
-      $('dispatchSel').value = 'sr';
-      updateDispatchUI();
-      renderPipelineDiagram();
-      log('WebNN stages set to ESPCN SR to match model format SR.');
-    }
+    // SR model implies the ESPCN SR dispatch.
+    $('dispatchSel').value = 'sr';
+  } else if ($('dispatchSel').value === 'sr') {
+    // A passthrough profile implies the passthrough dispatch.
+    $('dispatchSel').value = 'pass';
   }
+  updateDispatchUI();
+  renderPipelineDiagram();
   renderTileViz();
 });
 $('resSel').addEventListener('change', () => { geom = null; updateProfileLabels(); });
