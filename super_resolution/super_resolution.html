@@ -148,7 +148,7 @@
         <option value="skip-both">Skip compute + render</option>
       </select>
     </label>
-    <label title="Input frame resolution for the test-pattern source. Camera and local file use native source resolution.">Source resolution
+    <label title="Frame resolution for the test pattern and the requested camera capture size (the camera snaps to its nearest supported mode). A local file uses its own native resolution.">Source resolution
       <select id="resSel">
         <option value="640x360">640 &times; 360</option>
         <option value="1280x720" selected>1280 &times; 720</option>
@@ -901,9 +901,23 @@ async function startSyntheticSource() {
 }
 
 async function startCameraSource() {
-  mediaStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  // Request the selected Source resolution as the camera capture size (the
+  // browser snaps to the nearest mode the camera actually supports).
+  const { w, h } = getResolution();
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: w }, height: { ideal: h } },
+    audio: false,
+  });
   srcVideo.srcObject = mediaStream;
   await srcVideo.play();
+  // Report requested vs actual so it's clear whether the camera honored the size.
+  const track = mediaStream.getVideoTracks()[0];
+  const s = track ? track.getSettings() : {};
+  const got = `${s.width || '?'}x${s.height || '?'}`;
+  const cls = (s.width === w && s.height === h) ? 'ok' : 'err';
+  log(`Camera: requested ${w}x${h}, got ${got}` +
+      `${s.frameRate ? ` @ ${Math.round(s.frameRate)}fps` : ''}` +
+      `${cls === 'err' ? ' (camera snapped to its nearest supported mode)' : ''}.`, cls);
 }
 
 async function startFileSource(file) {
@@ -1574,10 +1588,10 @@ function updateSourceUI() {
   const src = $('sourceSel').value;
   const isInterop = $('pipelineSel').value === 'interop';
   $('fileInput').style.display = src === 'file' ? '' : 'none';
-  // Resolution applies to the test pattern (camera/file use native size), but
-  // interop ignores the source and sizes its tensors by this resolution, so keep
-  // it enabled there regardless of source.
-  $('resSel').disabled = !isInterop && src !== 'test';
+  // Resolution drives the test pattern and the requested camera capture size; a
+  // local file uses its own native size. Interop ignores the source and sizes
+  // its tensors by this resolution, so keep it enabled there too.
+  $('resSel').disabled = !isInterop && src === 'file';
   // The Source preview is only informative for real inputs (camera / file); the
   // test pattern is self-generated, so hide its (redundant) preview.
   $('sourceFigure').style.display = src === 'test' ? 'none' : '';
@@ -1602,9 +1616,9 @@ function updateDispatchUI() {
   }
 
   $('stage').style.display = isInterop ? 'none' : '';
-  // Interop sizes its tensors by the Source resolution (ignoring the source), so
-  // keep the resolution selector enabled in interop regardless of source.
-  $('resSel').disabled = !isInterop && $('sourceSel').value !== 'test';
+  // Interop sizes its tensors by the Source resolution (ignoring the source), and
+  // camera/test use it too; only a local file has a fixed native size.
+  $('resSel').disabled = !isInterop && $('sourceSel').value === 'file';
   updateResolutionInfo();
 }
 $('sourceSel').addEventListener('change', updateSourceUI);
