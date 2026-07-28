@@ -126,7 +126,7 @@
         <option value="interop">Interop only</option>
       </select>
     </label>
-    <label title="Choose the WebNN stages for the full video pipeline: Pass-through or ESPCN SR.">WebNN stages
+    <label title="Choose the WebNN dispatch mode for the full video pipeline: Pass-through or ESPCN SR.">WebNN dispatch mode
       <select id="dispatchSel">
         <option value="pass" selected>Pass-through</option>
         <option value="sr">ESPCN SR</option>
@@ -1160,7 +1160,7 @@ async function runLoop() {
     try {
       if (pipelineMode !== 'full' || dispatchMode !== 'sr') {
         if (!profile) {
-          throw new Error('Model format SR is only supported when Pipeline=Full and WebNN stages=ESPCN SR. Choose profile A, B, or C for this mode.');
+          throw new Error('Model format SR is only supported when Pipeline=Full and WebNN dispatch mode=ESPCN SR. Choose profile A, B, or C for this mode.');
         }
       }
 
@@ -1611,7 +1611,7 @@ function updateSourceUI() {
   $('sourceFigure').style.display = src === 'test' ? 'none' : '';
   updateResolutionInfo();
 }
-// Model format and WebNN stages are two views of the same choice (SR model <->
+// Model format and WebNN dispatch mode are two views of the same choice (SR model <->
 // ESPCN SR dispatch). Keep both enabled in Full mode and sync them, rather than
 // disabling both (which would lock the user out). Interop is passthrough-only.
 function updateDispatchUI() {
