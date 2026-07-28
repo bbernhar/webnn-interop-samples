@@ -139,14 +139,6 @@
         <option value="offline">No rAF</option>
       </select>
     </label>
-    <label title="Full pipeline only: selectively bypass WebGPU preprocess and/or render stages for A/B timing.">WebGPU stages
-      <select id="wgpuStageSel">
-        <option value="normal" selected>Normal (compute + render)</option>
-        <option value="skip-pre">Skip compute</option>
-        <option value="skip-render">Skip render</option>
-        <option value="skip-both">Skip compute + render</option>
-      </select>
-    </label>
     <label title="Frame resolution for the test pattern and the requested camera capture size (the camera snaps to its nearest supported mode). A local file uses its own native resolution.">Source resolution
       <select id="resSel">
         <option value="640x360">640 &times; 360</option>
@@ -783,36 +775,32 @@ function processFrameSR() {
   const metrics = { webgpuMs: 0, webnnMs: 0, transferMs: 0, ioMs: 0 };
   const { numTiles } = srGeom;
   const wg = Math.ceil(SR_TILE / 8); // 28
-  const preEnabled = isFullPreprocessEnabled();
-  const renderEnabled = isFullRenderEnabled();
 
   const tExpIn0 = performance.now();
   const inBuf = mlContext.exportToGPU(srInputTensor);
   metrics.transferMs += performance.now() - tExpIn0;
-  if (preEnabled) {
-    const tImport0 = performance.now();
-    const extTex = device.importExternalTexture({ source: srcVideo });
-    metrics.ioMs += performance.now() - tImport0;
-    const tPre0 = performance.now();
-    const preBind = device.createBindGroup({
-      layout: srPreprocPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: extTex },
-        { binding: 1, resource: { buffer: inBuf } },
-        { binding: 2, resource: { buffer: uniformBuffer } },
-      ],
-    });
-    const enc = device.createCommandEncoder();
-    {
-      const pass = enc.beginComputePass();
-      pass.setPipeline(srPreprocPipeline);
-      pass.setBindGroup(0, preBind);
-      pass.dispatchWorkgroups(wg, wg, numTiles);
-      pass.end();
-    }
-    device.queue.submit([enc.finish()]);
-    metrics.webgpuMs += performance.now() - tPre0;
+  const tImport0 = performance.now();
+  const extTex = device.importExternalTexture({ source: srcVideo });
+  metrics.ioMs += performance.now() - tImport0;
+  const tPre0 = performance.now();
+  const preBind = device.createBindGroup({
+    layout: srPreprocPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: extTex },
+      { binding: 1, resource: { buffer: inBuf } },
+      { binding: 2, resource: { buffer: uniformBuffer } },
+    ],
+  });
+  const enc = device.createCommandEncoder();
+  {
+    const pass = enc.beginComputePass();
+    pass.setPipeline(srPreprocPipeline);
+    pass.setBindGroup(0, preBind);
+    pass.dispatchWorkgroups(wg, wg, numTiles);
+    pass.end();
   }
+  device.queue.submit([enc.finish()]);
+  metrics.webgpuMs += performance.now() - tPre0;
 
   const tDestIn0 = performance.now();
   inBuf.destroy(); // ownership -> WebNN
@@ -822,40 +810,38 @@ function processFrameSR() {
   mlContext.dispatch(srGraph, { input: srInputTensor }, { output: srOutputTensor });
   metrics.webnnMs += performance.now() - tDisp0;
 
-  if (renderEnabled) {
-    const tExpOut0 = performance.now();
-    const outBuf = mlContext.exportToGPU(srOutputTensor);
-    metrics.transferMs += performance.now() - tExpOut0;
-    const tRender0 = performance.now();
-    const renderBind = device.createBindGroup({
-      layout: srRenderPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: outBuf } },
-        { binding: 1, resource: { buffer: uniformBuffer } },
-      ],
+  const tExpOut0 = performance.now();
+  const outBuf = mlContext.exportToGPU(srOutputTensor);
+  metrics.transferMs += performance.now() - tExpOut0;
+  const tRender0 = performance.now();
+  const renderBind = device.createBindGroup({
+    layout: srRenderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: outBuf } },
+      { binding: 1, resource: { buffer: uniformBuffer } },
+    ],
+  });
+  const enc2 = device.createCommandEncoder();
+  {
+    const pass = enc2.beginRenderPass({
+      colorAttachments: [{
+        view: gpuContext.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
     });
-    const enc = device.createCommandEncoder();
-    {
-      const pass = enc.beginRenderPass({
-        colorAttachments: [{
-          view: gpuContext.getCurrentTexture().createView(),
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          loadOp: 'clear',
-          storeOp: 'store',
-        }],
-      });
-      pass.setPipeline(srRenderPipeline);
-      pass.setBindGroup(0, renderBind);
-      pass.draw(3);
-      pass.end();
-    }
-    device.queue.submit([enc.finish()]);
-    metrics.webgpuMs += performance.now() - tRender0;
-
-    const tDestOut0 = performance.now();
-    outBuf.destroy(); // ownership -> WebNN
-    metrics.transferMs += performance.now() - tDestOut0;
+    pass.setPipeline(srRenderPipeline);
+    pass.setBindGroup(0, renderBind);
+    pass.draw(3);
+    pass.end();
   }
+  device.queue.submit([enc2.finish()]);
+  metrics.webgpuMs += performance.now() - tRender0;
+
+  const tDestOut0 = performance.now();
+  outBuf.destroy(); // ownership -> WebNN
+  metrics.transferMs += performance.now() - tDestOut0;
   return metrics;
 }
 
@@ -988,41 +974,37 @@ function processFrame(profile) {
   const { tilesX, tilesY, numTiles } = geom;
   const wgX = Math.ceil(profile.tileW / 8);
   const wgY = Math.ceil(profile.tileH / 8);
-  const preEnabled = isFullPreprocessEnabled();
-  const renderEnabled = isFullRenderEnabled();
 
   // --- 1) Export WebNN input tensor -> GPUBuffer; write tiles into it. --------
   const tExpIn0 = performance.now();
   const inBuf = mlContext.exportToGPU(inputTensor);
   metrics.transferMs += performance.now() - tExpIn0;
 
-  if (preEnabled) {
-    // Import the current (YUV-decoded) video frame directly as a GPUExternalTexture
-    // and sample it in the compute pass via textureLoad (no intermediate copy).
-    const tImport0 = performance.now();
-    const extTex = device.importExternalTexture({ source: srcVideo });
-    metrics.ioMs += performance.now() - tImport0;
-    const tPre0 = performance.now();
-    const preprocBind = device.createBindGroup({
-      layout: preprocPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: extTex },
-        { binding: 1, resource: { buffer: inBuf } },
-        { binding: 2, resource: { buffer: uniformBuffer } },
-      ],
-    });
+  // Import the current (YUV-decoded) video frame directly as a GPUExternalTexture
+  // and sample it in the compute pass via textureLoad (no intermediate copy).
+  const tImport0 = performance.now();
+  const extTex = device.importExternalTexture({ source: srcVideo });
+  metrics.ioMs += performance.now() - tImport0;
+  const tPre0 = performance.now();
+  const preprocBind = device.createBindGroup({
+    layout: preprocPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: extTex },
+      { binding: 1, resource: { buffer: inBuf } },
+      { binding: 2, resource: { buffer: uniformBuffer } },
+    ],
+  });
 
-    const enc = device.createCommandEncoder();
-    {
-      const pass = enc.beginComputePass();
-      pass.setPipeline(preprocPipeline);
-      pass.setBindGroup(0, preprocBind);
-      pass.dispatchWorkgroups(wgX, wgY, numTiles);
-      pass.end();
-    }
-    device.queue.submit([enc.finish()]);
-    metrics.webgpuMs += performance.now() - tPre0;
+  const enc = device.createCommandEncoder();
+  {
+    const pass = enc.beginComputePass();
+    pass.setPipeline(preprocPipeline);
+    pass.setBindGroup(0, preprocBind);
+    pass.dispatchWorkgroups(wgX, wgY, numTiles);
+    pass.end();
   }
+  device.queue.submit([enc.finish()]);
+  metrics.webgpuMs += performance.now() - tPre0;
 
   // --- 2) Hand exclusive ownership back to WebNN. -----------------------------
   const tDestIn0 = performance.now();
@@ -1034,44 +1016,42 @@ function processFrame(profile) {
   mlContext.dispatch(mlGraph, { input: inputTensor }, { output: outputTensor });
   metrics.webnnMs += performance.now() - tDisp0;
 
-  if (renderEnabled) {
-    // --- 4) Export WebNN output tensor -> GPUBuffer; render straight to canvas. -
-    const tExpOut0 = performance.now();
-    const outBuf = mlContext.exportToGPU(outputTensor);
-    metrics.transferMs += performance.now() - tExpOut0;
+  // --- 4) Export WebNN output tensor -> GPUBuffer; render straight to canvas. -
+  const tExpOut0 = performance.now();
+  const outBuf = mlContext.exportToGPU(outputTensor);
+  metrics.transferMs += performance.now() - tExpOut0;
 
-    const tRender0 = performance.now();
-    const renderBind = device.createBindGroup({
-      layout: renderPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: outBuf } },
-        { binding: 1, resource: { buffer: uniformBuffer } },
-      ],
+  const tRender0 = performance.now();
+  const renderBind = device.createBindGroup({
+    layout: renderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: outBuf } },
+      { binding: 1, resource: { buffer: uniformBuffer } },
+    ],
+  });
+
+  const enc2 = device.createCommandEncoder();
+  {
+    const pass = enc2.beginRenderPass({
+      colorAttachments: [{
+        view: gpuContext.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
     });
-
-    const enc = device.createCommandEncoder();
-    {
-      const pass = enc.beginRenderPass({
-        colorAttachments: [{
-          view: gpuContext.getCurrentTexture().createView(),
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          loadOp: 'clear',
-          storeOp: 'store',
-        }],
-      });
-      pass.setPipeline(renderPipeline);
-      pass.setBindGroup(0, renderBind);
-      pass.draw(3);
-      pass.end();
-    }
-    device.queue.submit([enc.finish()]);
-    metrics.webgpuMs += performance.now() - tRender0;
-
-    // --- 5) Revoke exclusive handle; WebNN may write outTensor next frame. ------
-    const tDestOut0 = performance.now();
-    outBuf.destroy();
-    metrics.transferMs += performance.now() - tDestOut0;
+    pass.setPipeline(renderPipeline);
+    pass.setBindGroup(0, renderBind);
+    pass.draw(3);
+    pass.end();
   }
+  device.queue.submit([enc2.finish()]);
+  metrics.webgpuMs += performance.now() - tRender0;
+
+  // --- 5) Revoke exclusive handle; WebNN may write outTensor next frame. ------
+  const tDestOut0 = performance.now();
+  outBuf.destroy();
+  metrics.transferMs += performance.now() - tDestOut0;
   return metrics;
 }
 
@@ -1284,7 +1264,6 @@ async function start() {
     console.log('[SR Benchmark] Start options', {
       pipeline: $('pipelineSel').value,
       webnnDispatch: $('dispatchSel').value,
-      webgpuFullStages: $('wgpuStageSel').value,
       modelFormat: $('profileSel').value,
       webnnDevice: $('deviceSel').value,
       webgpuAdapter: $('gpuSel').value,
@@ -1419,17 +1398,6 @@ function updateTotalsInfo(avgUs) {
     ? `Video/Present/Wait${avgUs ? ` (total ${fmt(avgUs.ioUs)})` : ''}`
     : 'Video/Present/Wait';
 }
-function getWgpuStageMode() {
-  return $('wgpuStageSel').value;
-}
-function isFullPreprocessEnabled() {
-  const mode = getWgpuStageMode();
-  return mode !== 'skip-pre' && mode !== 'skip-both';
-}
-function isFullRenderEnabled() {
-  const mode = getWgpuStageMode();
-  return mode !== 'skip-render' && mode !== 'skip-both';
-}
 function getResolution() {
   const [w, h] = $('resSel').value.split('x').map(Number);
   return { w, h };
@@ -1553,24 +1521,6 @@ function renderPipelineDiagram() {
   // video pipeline layout.
   const modeKey = isInterop ? 'interop' : dispatchMode;
   const stages = [...(PIPELINE_STAGES[modeKey] || PIPELINE_STAGES.pass)];
-  if (pipelineMode !== 'interop') {
-    if (!isFullPreprocessEnabled()) {
-      const importIdx = stages.indexOf('import');
-      if (importIdx >= 0) stages.splice(importIdx, 1);
-      const preIdx = stages.indexOf('pre');
-      if (preIdx >= 0) stages.splice(preIdx, 1);
-    }
-    if (!isFullRenderEnabled()) {
-      const expOutIdx = stages.indexOf('expOut');
-      if (expOutIdx >= 0) stages.splice(expOutIdx, 1);
-      const renderIdx = stages.indexOf('render');
-      if (renderIdx >= 0) stages.splice(renderIdx, 1);
-      const destOutIdx = stages.indexOf('destOut');
-      if (destOutIdx >= 0) stages.splice(destOutIdx, 1);
-      const presentIdx = stages.indexOf('present');
-      if (presentIdx >= 0) stages.splice(presentIdx, 1);
-    }
-  }
   const chips = $('chips');
   chips.innerHTML = '';
   stages.forEach((key, i) => {
@@ -1617,7 +1567,6 @@ function updateSourceUI() {
 function updateDispatchUI() {
   const isInterop = $('pipelineSel').value === 'interop';
   $('flushSel').disabled = isInterop;
-  $('wgpuStageSel').disabled = isInterop;
   $('dispatchSel').disabled = isInterop;
   $('profileSel').disabled = false;
 
@@ -1649,7 +1598,6 @@ $('dispatchSel').addEventListener('change', () => {
   renderPipelineDiagram();
   renderTileViz();
 });
-$('wgpuStageSel').addEventListener('change', () => { renderPipelineDiagram(); });
 $('flushSel').addEventListener('change', () => { renderPipelineDiagram(); });
 $('profileSel').addEventListener('change', () => {
   const p = $('profileSel').value;
@@ -1689,7 +1637,6 @@ const URL_PARAMS = {
   pipeline:   'pipelineSel',
   webnn:      'dispatchSel',
   completion: 'flushSel',
-  wgpu:       'wgpuStageSel',
   res:        'resSel',
   source:     'sourceSel',
 };
