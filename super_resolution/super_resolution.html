@@ -132,10 +132,9 @@
         <option value="sr">ESPCN SR</option>
       </select>
     </label>
-    <label title="Full pipeline only: choose serialized per-frame flush, rAF pacing, or no rAF mode.">Frame completion
+    <label title="Interop-only mode: always awaits onSubmittedWorkDone to measure handshake cost. Full pipeline: choose rAF pacing or no rAF mode.">Frame completion
       <select id="flushSel">
-        <option value="on" selected>onSubmittedWorkDone</option>
-        <option value="off">rAF</option>
+        <option value="off" selected>rAF</option>
         <option value="offline">No rAF</option>
       </select>
     </label>
@@ -1186,15 +1185,10 @@ async function runLoop() {
         const isSR = dispatchMode === 'sr';
         if (isSR) await ensureSRResources();
         else await ensureResources(profile);
-        const flush = $('flushSel').value; // 'on' = onSubmittedWorkDone, 'off' = rAF-paced, 'offline' = no rAF pacing
+        const flush = $('flushSel').value; // 'off' = rAF-paced, 'offline' = no rAF pacing
         const t0 = performance.now();
         const metrics = isSR ? processFrameSR() : processFrame(profile);
-        if (flush === 'on') {
-          // Flush: wait for the whole frame to finish -> serialized latency.
-          const tw0 = performance.now();
-          await device.queue.onSubmittedWorkDone();
-          metrics.ioMs += performance.now() - tw0;
-        } else if (flush === 'off') {
+        if (flush === 'off') {
           // No flush: pace on the next animation frame so the pipeline can
           // overlap frames (present happens naturally) -> throughput.
           const tr0 = performance.now();
@@ -1228,11 +1222,7 @@ async function runLoop() {
           // value instead of bouncing like the 500ms-window reading.
           const cumMs = cumTimeSum / cumFrames;
           const cumFps = (cumFrames * 1000) / (now - runStart);
-          if (flush === 'on') {
-            const avgMs = frameTimeSum / frames;
-            $('spanLabel').textContent =
-              `Frame time = ${cumMs.toFixed(2)} ms/frame (avg) \u00b7 ${avgMs.toFixed(2)} ms/frame (current)`;
-          } else if (flush === 'off') {
+          if (flush === 'off') {
             const fps = (frames * 1000) / (now - lastFpsTime);
             $('spanLabel').textContent =
               `Frame rate = ${cumFps.toFixed(1)} fps (avg) \u00b7 ${fps.toFixed(1)} fps (current)`;
@@ -1338,7 +1328,7 @@ const CHIP_META = {
   render:  'WebGPU render\n(post-process)',
   destOut: 'import\n(output)',
   present: 'present',
-  gpuWait: 'completion\n(GPU-wait)',
+  gpuWait: 'onSubmittedWorkDone',
 };
 const CHIP_CONV = {
   video: 'decoded frame',
