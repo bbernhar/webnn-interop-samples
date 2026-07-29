@@ -174,7 +174,7 @@
 
   <div id="tileViz">
     <div class="section-head">
-      <span class="pipeline-title">Frame tiling (per Model format)</span>
+      <span class="pipeline-title">Frame tiling</span>
       <span id="tileCaption" class="stat"></span>
     </div>
     <svg id="tileSvg" width="0" height="0" aria-hidden="true"></svg>
@@ -239,7 +239,7 @@ const PROFILES = {
 };
 const CHANNELS = 3;
 
-// Embedded SR-10 tensor metadata for file:// execution (no network fetch).
+// Embedded SR-10 tensor metadata.
 const SR10_EMBEDDED_TENSORS = [
   { name: 'conv1.weight', shape: [64, 1, 5, 5], offset: 0, count: 1600 },
   { name: 'conv1.bias', shape: [64], offset: 1600, count: 64 },
