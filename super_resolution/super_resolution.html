@@ -225,6 +225,12 @@ function log(msg, cls) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+function pushRollingSample(bucket, sample, now) {
+  bucket.push(sample);
+  const cutoff = now - ROLLING_WINDOW_MS;
+  while (bucket.length && bucket[0].t < cutoff) bucket.shift();
+}
+
 // -----------------------------------------------------------------------------
 // Model profiles. Dimensions follow the spec's H x W convention.
 // dtype is float32 for all profiles in this benchmark (the spec notes model
@@ -285,6 +291,8 @@ let scratchBuffer = null;
 
 // Repetitions per sample in interop-only mode (amortizes call + timer noise).
 const INTEROP_REPS = 64;
+// Rolling average window for the displayed "avg" metrics.
+const ROLLING_WINDOW_MS = 5000;
 
 let running = false;
 let rafId = 0;
@@ -296,15 +304,12 @@ let geom = null; // { frameW, frameH, tilesX, tilesY, numTiles, profile }
 const srcVideo = $('srcVideo');
 const outCanvas = $('outCanvas');
 
-// Per-frame latency bookkeeping.
-let frames = 0, frameTimeSum = 0, lastFpsTime = 0;
-// Cumulative (whole-run) counters for a stable, converging average that doesn't
-// bounce like the per-window reading. Reset each time the run starts.
-let cumFrames = 0, cumTimeSum = 0, runStart = 0;
+// Per-window display bookkeeping.
+let frames = 0, lastFpsTime = 0;
 // Interop-only per-call accumulators (per cycle, ms).
 let expInSum = 0, wgpuSum = 0, expOutSum = 0, destInSum = 0, destOutSum = 0, dispSum = 0, gpuWaitSum = 0;
-// Cumulative (whole-run) interop accumulators for a stable, converging average.
-let cExpIn = 0, cWgpu = 0, cExpOut = 0, cDestIn = 0, cDestOut = 0, cDisp = 0, cGpuWait = 0;
+let interopSamples = [];
+let frameSamples = [];
 let offlineYieldCounter = 0;
 let lastNonSrProfile = 'C';
 
@@ -1149,10 +1154,17 @@ async function runLoop() {
         frames++;
         expInSum += m.expInMs; wgpuSum += m.wgpuMs; destInSum += m.destInMs; dispSum += m.dispMs;
         expOutSum += m.expOutMs; destOutSum += m.destOutMs; gpuWaitSum += m.gpuWaitMs;
-        cumFrames++;
-        cExpIn += m.expInMs; cWgpu += m.wgpuMs; cDestIn += m.destInMs; cDisp += m.dispMs;
-        cExpOut += m.expOutMs; cDestOut += m.destOutMs; cGpuWait += m.gpuWaitMs;
         const now = performance.now();
+        pushRollingSample(interopSamples, {
+          t: now,
+          expInUs: m.expInMs * 1000,
+          wgpuUs: m.wgpuMs * 1000,
+          destInUs: m.destInMs * 1000,
+          dispUs: m.dispMs * 1000,
+          expOutUs: m.expOutMs * 1000,
+          destOutUs: m.destOutMs * 1000,
+          gpuWaitUs: m.gpuWaitMs * 1000,
+        }, now);
         if (now - lastFpsTime >= 500) {
           // Current (bouncy) per-window averages.
           const eIn = (expInSum / frames) * 1000;
@@ -1163,21 +1175,33 @@ async function runLoop() {
           const dOut = (destOutSum / frames) * 1000;
           const gpu = (gpuWaitSum / frames) * 1000;
           const total = eIn + wgp + dIn + dsp + eOut + dOut + gpu;
-          // Cumulative (whole-run) averages: stable / converging.
-          const aeIn = (cExpIn / cumFrames) * 1000;
-          const awgp = (cWgpu / cumFrames) * 1000;
-          const adIn = (cDestIn / cumFrames) * 1000;
-          const adsp = (cDisp / cumFrames) * 1000;
-          const aeOut = (cExpOut / cumFrames) * 1000;
-          const adOut = (cDestOut / cumFrames) * 1000;
-          const agpu = (cGpuWait / cumFrames) * 1000;
+          // Rolling-window averages over recent samples.
+          let sumExpInUs = 0, sumWgpuUs = 0, sumDestInUs = 0, sumDispUs = 0;
+          let sumExpOutUs = 0, sumDestOutUs = 0, sumGpuWaitUs = 0;
+          for (const s of interopSamples) {
+            sumExpInUs += s.expInUs;
+            sumWgpuUs += s.wgpuUs;
+            sumDestInUs += s.destInUs;
+            sumDispUs += s.dispUs;
+            sumExpOutUs += s.expOutUs;
+            sumDestOutUs += s.destOutUs;
+            sumGpuWaitUs += s.gpuWaitUs;
+          }
+          const n = Math.max(1, interopSamples.length);
+          const aeIn = sumExpInUs / n;
+          const awgp = sumWgpuUs / n;
+          const adIn = sumDestInUs / n;
+          const adsp = sumDispUs / n;
+          const aeOut = sumExpOutUs / n;
+          const adOut = sumDestOutUs / n;
+          const agpu = sumGpuWaitUs / n;
           const avgTotal = aeIn + awgp + adIn + adsp + aeOut + adOut + agpu;
           const transferSum = aeIn + adIn + aeOut + adOut;
-          // Chips show the stable cumulative averages.
+          // Chips show rolling-window averages.
           setChip('expIn', aeIn); setChip('wgpu', awgp); setChip('destIn', adIn); setChip('disp', adsp);
           setChip('expOut', aeOut); setChip('destOut', adOut); setChip('gpuWait', agpu);
           $('spanLabel').textContent =
-            `Iteration = ${(avgTotal / 1000).toFixed(3)} ms (avg) · ${(total / 1000).toFixed(3)} ms (current) (×${INTEROP_REPS})`;
+            `Iteration = ${(avgTotal / 1000).toFixed(3)} ms (avg ${ROLLING_WINDOW_MS / 1000}s) · ${(total / 1000).toFixed(3)} ms (current) (×${INTEROP_REPS})`;
           updateTotalsInfo({ webgpuUs: awgp, webnnUs: adsp, transferUs: transferSum, ioUs: agpu });
           frames = 0; expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
         }
@@ -1213,25 +1237,23 @@ async function runLoop() {
         const dt = performance.now() - t0;
 
         frames++;
-        frameTimeSum += dt;
-        cumFrames++;
-        cumTimeSum += dt;
         const now = performance.now();
+        pushRollingSample(frameSamples, { t: now, dtMs: dt }, now);
         if (now - lastFpsTime >= 500) {
-          // Cumulative averages over the whole run: these converge to a stable
-          // value instead of bouncing like the 500ms-window reading.
-          const cumMs = cumTimeSum / cumFrames;
-          const cumFps = (cumFrames * 1000) / (now - runStart);
+          // Rolling average over the recent window, plus a current 500ms reading.
+          let sumDtMs = 0;
+          for (const s of frameSamples) sumDtMs += s.dtMs;
+          const rollingFps = sumDtMs > 0 ? (frameSamples.length * 1000) / sumDtMs : 0;
+          const fps = (frames * 1000) / (now - lastFpsTime);
           if (flush === 'off') {
-            const fps = (frames * 1000) / (now - lastFpsTime);
             $('spanLabel').textContent =
-              `Frame rate = ${cumFps.toFixed(1)} fps (avg) \u00b7 ${fps.toFixed(1)} fps (current)`;
+              `Frame rate = ${rollingFps.toFixed(1)} fps (avg ${ROLLING_WINDOW_MS / 1000}s) · ${fps.toFixed(1)} fps (current)`;
           } else {
-            const fps = (frames * 1000) / (now - lastFpsTime);
             $('spanLabel').textContent =
-                `Frame rate = ${cumFps.toFixed(1)} fps (avg) \u00b7 ${fps.toFixed(1)} fps (current, no rAF)`;
+              `Frame rate = ${rollingFps.toFixed(1)} fps (avg ${ROLLING_WINDOW_MS / 1000}s) · ${fps.toFixed(1)} fps (current, no rAF)`;
           }
-          frames = 0; frameTimeSum = 0; lastFpsTime = now;
+          frames = 0;
+          lastFpsTime = now;
         }
       } else {
         // Source not ready yet; yield briefly and retry.
@@ -1283,14 +1305,14 @@ async function start() {
     srGeom = null;
     running = true;
     $('stopBtn').disabled = false;
-    lastFpsTime = performance.now(); frames = 0; frameTimeSum = 0;
-    cumFrames = 0; cumTimeSum = 0; runStart = performance.now();
+    lastFpsTime = performance.now(); frames = 0;
     expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0;
-    cExpIn = 0; cWgpu = 0; cDestIn = 0; cDisp = 0; cExpOut = 0; cDestOut = 0; cGpuWait = 0;
+    interopSamples = [];
+    frameSamples = [];
     offlineYieldCounter = 0;
     updateTotalsInfo();
     renderPipelineDiagram();
-    log('Running (measuring per-frame latency).', 'ok');
+    log(`Running (rolling avg window: ${ROLLING_WINDOW_MS / 1000}s).`, 'ok');
     runLoop();
   } catch (e) {
     log(`${e.name}: ${e.message}`, 'err');
@@ -1530,7 +1552,7 @@ function renderPipelineDiagram() {
   // Only show the span label while running; keep it blank when idle.
   const spanPrefix = isInterop
     ? 'Iteration'
-    : ($('flushSel').value === 'on' ? 'Frame time' : 'Frame rate');
+    : 'Frame rate';
   $('spanLabel').textContent = running ? spanPrefix : '';
   updateTotalsInfo();
 }
