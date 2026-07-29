@@ -220,7 +220,7 @@
 
   <div id="stage">
     <figure id="sourceFigure">
-      <figcaption>Source (decoded input)</figcaption>
+      <figcaption>Source (decoded input) <span id="sourceInfo" class="stat"></span></figcaption>
       <video id="srcVideo" width="480" height="270" muted playsinline loop></video>
     </figure>
     <figure>
@@ -1491,6 +1491,8 @@ function updateResolutionInfo() {
 
   const targetEl = $('targetInfo');
   if (targetEl) targetEl.textContent = `\u2192 ${targetText}`;
+  const sourceEl = $('sourceInfo');
+  if (sourceEl) sourceEl.textContent = `\u2192 ${srcText}`;
   renderTileViz();
 }
 // Tile size in effect for the selected Model format (SR uses a fixed 224 tile).
