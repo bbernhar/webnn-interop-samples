@@ -202,8 +202,8 @@
     <div class="chips" id="chips"></div>
     <div class="spanbar"><span class="span-label" id="spanLabel"></span></div>
     <div class="legend">
-      <span class="legend-item"><span class="swatch swatch-webgpu"></span> <span id="legendWebgpu">WebGPU</span></span>
-      <span class="legend-item"><span class="swatch swatch-webnn"></span> <span id="legendWebnn">WebNN</span></span>
+      <span class="legend-item"><span class="swatch swatch-webgpu"></span> <span id="legendWebgpu">WebGPU compute/render</span></span>
+      <span class="legend-item"><span class="swatch swatch-webnn"></span> <span id="legendWebnn">WebNN dispatch</span></span>
       <span class="legend-item"><span class="swatch swatch-transfer"></span> <span id="legendTransfer">Tensor transfer</span></span>
       <span class="legend-item"><span class="swatch swatch-io"></span> <span id="legendIo">Video/Present/Wait</span></span>
       <span class="legend-item">Per-stage timings are CPU wall-time, averaged.</span>
@@ -212,7 +212,7 @@
 
   <div id="tileViz">
     <div class="section-head">
-      <span class="pipeline-title">Frame tiling</span>
+      <span class="pipeline-title">Frame</span>
       <span id="tileCaption" class="stat"></span>
     </div>
     <svg id="tileSvg" width="0" height="0" aria-hidden="true"></svg>
@@ -1377,15 +1377,15 @@ function stop() {
 // =============================================================================
 const CHIP_META = {
   import:  'importExternalTexture',
-  expIn:   'exportToGPU\n(input)',
+  expIn:   'exportToGPU',
   wgpu:    'WebGPU compute\n(pass-through)',
   pre:     'WebGPU compute\n(pre-process)',
-  destIn:  'import\n(input)',
+  destIn:  'import',
   disp:    'WebNN dispatch\n(pass-through)',
   dispSR:  'WebNN dispatch\n(ESPCN SR)',
-  expOut:  'exportToGPU\n(output)',
+  expOut:  'exportToGPU',
   render:  'WebGPU render\n(post-process)',
-  destOut: 'import\n(output)',
+  destOut: 'import',
   present: 'present',
   gpuWait: 'onSubmittedWorkDone',
 };
@@ -1436,9 +1436,6 @@ const STAGE_DOMAIN = {
   disp: 'webnn',
   dispSR: 'webnn',
 };
-// A "stage" is actual dispatch/compute work; exportToGPU/import chips are just
-// ownership handoffs (and video/present/completion are I/O), so they don't count.
-const COMPUTE_STAGES = new Set(['wgpu', 'pre', 'disp', 'dispSR', 'render']);
 function setChip(key, us) {
   const el = document.getElementById('val-' + key);
   if (el) el.textContent = `${us.toFixed(0)} µs`;
@@ -1447,11 +1444,11 @@ function updateTotalsInfo(avgUs) {
   const isInterop = $('pipelineSel').value === 'interop';
   const fmt = (v) => `${(v / 1000).toFixed(3)} ms`;
   $('legendWebgpu').textContent = isInterop
-    ? `WebGPU${avgUs ? ` (total ${fmt(avgUs.webgpuUs)})` : ''}`
-    : 'WebGPU';
+    ? `WebGPU compute/render${avgUs ? ` (total ${fmt(avgUs.webgpuUs)})` : ''}`
+    : 'WebGPU compute/render';
   $('legendWebnn').textContent = isInterop
-    ? `WebNN${avgUs ? ` (total ${fmt(avgUs.webnnUs)})` : ''}`
-    : 'WebNN';
+    ? `WebNN dispatch${avgUs ? ` (total ${fmt(avgUs.webnnUs)})` : ''}`
+    : 'WebNN dispatch';
   $('legendTransfer').textContent = isInterop
     ? `Tensor transfer${avgUs ? ` (total ${fmt(avgUs.transferUs)})` : ''}`
     : 'Tensor transfer';
@@ -1599,8 +1596,7 @@ function renderPipelineDiagram() {
       chips.appendChild(ar);
     }
   });
-  const computeCount = stages.filter((k) => COMPUTE_STAGES.has(k)).length;
-  $('pipelineTitle').textContent = `Pipeline (${computeCount} compute stages)`;
+  $('pipelineTitle').textContent = 'Pipeline';
   // Only show the span label while running; keep it blank when idle.
   const spanPrefix = isInterop
     ? 'Iteration'
