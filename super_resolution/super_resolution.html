@@ -63,6 +63,44 @@
   .chip.domain-io { border-color: #7d8692; background: #1d2127; }
   .chip .name { font-size: 13px; color: #cdd2d7; white-space: pre-line; line-height: 1.2; }
   .chip .conv { font-size: 12px; color: #9aa0a6; margin-top: 5px; white-space: pre-line; line-height: 1.15; min-height: 28px; }
+  .chip .io-row {
+    margin-top: 7px;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .chip .io-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .chip .io-label {
+    font-size: 10px;
+    color: #9aa0a6;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    flex: 0 0 auto;
+  }
+  .chip .io-box {
+    font-size: 10px;
+    line-height: 1.2;
+    border-radius: 4px;
+    padding: 2px 6px;
+    border: 1px solid #4a515a;
+    color: #d8dde3;
+    background: #252a31;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chip .io-kind-video { border-color: #7d8692; background: #242930; }
+  .chip .io-kind-texture { border-color: #6f90cf; background: #1c2940; }
+  .chip .io-kind-tensor { border-color: #5eae8b; background: #1a2d25; }
+  .chip .io-kind-buffer { border-color: #d8a661; background: #322714; }
+  .chip .io-kind-canvas { border-color: #7cb7d9; background: #173042; }
+  .chip .io-kind-display { border-color: #a785d3; background: #2a2140; }
+  .chip .io-kind-sync { border-color: #8c98a5; background: #2b3038; }
   .chip .val { font-size: 15px; font-variant-numeric: tabular-nums; color: #a5d6a7; margin-top: 6px; min-height: 19px; }
   .chip .batch { font-size: 11px; color: #9aa0a6; margin-top: 3px; }
   .arrow { align-self: center; color: #6b7178; padding: 0 8px; font-size: 18px; }
@@ -132,10 +170,10 @@
         <option value="sr">ESPCN SR</option>
       </select>
     </label>
-    <label title="Interop-only mode: always awaits onSubmittedWorkDone to measure handshake cost. Full pipeline: choose rAF pacing or no rAF mode.">Frame completion
+    <label title="Full pipeline pacing mode: rAF (display-paced) or No rAF (unpaced). Interop-only always waits onSubmittedWorkDone.">Frame completion
       <select id="flushSel">
-        <option value="off" selected>rAF</option>
-        <option value="offline">No rAF</option>
+        <option value="off" selected title="Display-paced: waits for requestAnimationFrame each cycle.">rAF</option>
+        <option value="offline" title="Unpaced: no requestAnimationFrame wait; periodic GPU drains keep the queue bounded.">No rAF</option>
       </select>
     </label>
     <label title="Frame resolution for the test pattern and the requested camera capture size (the camera snaps to its nearest supported mode). A local file uses its own native resolution.">Source resolution
@@ -160,7 +198,7 @@
   </div>
 
   <div id="pipeline">
-    <div class="pipeline-title" id="pipelineTitle">Per-frame pipeline</div>
+    <div class="pipeline-title" id="pipelineTitle">Pipeline</div>
     <div class="chips" id="chips"></div>
     <div class="spanbar"><span class="span-label" id="spanLabel"></span></div>
     <div class="legend">
@@ -1250,7 +1288,7 @@ async function runLoop() {
               `Frame rate = ${rollingFps.toFixed(1)} fps (avg ${ROLLING_WINDOW_MS / 1000}s) · ${fps.toFixed(1)} fps (current)`;
           } else {
             $('spanLabel').textContent =
-              `Frame rate = ${rollingFps.toFixed(1)} fps (avg ${ROLLING_WINDOW_MS / 1000}s) · ${fps.toFixed(1)} fps (current, no rAF)`;
+              `Frame rate = ${rollingFps.toFixed(1)} fps (avg ${ROLLING_WINDOW_MS / 1000}s) · ${fps.toFixed(1)} fps (current)`;
           }
           frames = 0;
           lastFpsTime = now;
@@ -1338,7 +1376,6 @@ function stop() {
 // underneath spans exactly what the current metric captures.
 // =============================================================================
 const CHIP_META = {
-  video:   'Video\nframe',
   import:  'importExternalTexture',
   expIn:   'exportToGPU\n(input)',
   wgpu:    'WebGPU compute\n(pass-through)',
@@ -1353,27 +1390,39 @@ const CHIP_META = {
   gpuWait: 'onSubmittedWorkDone',
 };
 const CHIP_CONV = {
-  video: 'decoded frame',
-  import: 'VideoFrame -> GPUExternalTexture',
-  expIn: 'MLTensor -> GPUBuffer',
-  wgpu: 'in-place write',
-  pre: 'RGB -> BGR + tile pack',
-  destIn: 'GPUBuffer -> MLTensor',
+  import: 'import video texture',
+  expIn: 'export ownership',
+  wgpu: 'compute pass',
+  pre: 'tile + BGR pack',
+  destIn: 'return ownership',
   disp: 'identity graph',
   dispSR: 'ESPCN 3x upscale',
-  expOut: 'MLTensor -> GPUBuffer',
-  render: 'BGR -> RGBA + stitch',
-  destOut: 'GPUBuffer -> MLTensor',
-  present: 'swapchain present',
-  gpuWait: 'queue drain wait',
+  expOut: 'export ownership',
+  render: 'render + stitch',
+  destOut: 'return ownership',
+  present: 'present frame',
+  gpuWait: 'await completion',
+};
+const STAGE_IO = {
+  import: { in: 'VideoFrame', inKind: 'video', out: 'GPUExternalTexture', outKind: 'texture' },
+  expIn: { in: 'MLTensor(input)', inKind: 'tensor', out: 'GPUBuffer', outKind: 'buffer' },
+  wgpu: { in: 'GPUBuffer', inKind: 'buffer', out: 'GPUBuffer', outKind: 'buffer' },
+  pre: { in: 'GPUExternalTexture', inKind: 'texture', out: 'GPUBuffer', outKind: 'buffer' },
+  destIn: { in: 'GPUBuffer', inKind: 'buffer', out: 'MLTensor(input)', outKind: 'tensor' },
+  disp: { in: 'MLTensor(input)', inKind: 'tensor', out: 'MLTensor(output)', outKind: 'tensor' },
+  dispSR: { in: 'MLTensor(input)', inKind: 'tensor', out: 'MLTensor(output)', outKind: 'tensor' },
+  expOut: { in: 'MLTensor(output)', inKind: 'tensor', out: 'GPUBuffer', outKind: 'buffer' },
+  render: { in: 'GPUBuffer', inKind: 'buffer', out: 'Canvas', outKind: 'canvas' },
+  destOut: { in: 'GPUBuffer', inKind: 'buffer', out: 'MLTensor(output)', outKind: 'tensor' },
+  present: { in: 'Canvas', inKind: 'canvas', out: 'Display', outKind: 'display' },
+  gpuWait: { in: 'Queue work', inKind: 'sync', out: 'Completed', outKind: 'sync' },
 };
 const PIPELINE_STAGES = {
   interop: ['expIn', 'wgpu', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
-  pass:    ['video', 'import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
-  sr:      ['video', 'import', 'expIn', 'pre', 'destIn', 'dispSR', 'expOut', 'render', 'destOut', 'present'],
+  pass:    ['import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
+  sr:      ['import', 'expIn', 'pre', 'destIn', 'dispSR', 'expOut', 'render', 'destOut', 'present'],
 };
 const STAGE_DOMAIN = {
-  video: 'io',
   present: 'io',
   gpuWait: 'io',
   import: 'io',
@@ -1538,7 +1587,10 @@ function renderPipelineDiagram() {
   stages.forEach((key, i) => {
     const chip = document.createElement('div');
     chip.className = `chip domain-${STAGE_DOMAIN[key] || 'io'}`;
-    chip.innerHTML = `<div class="name">${CHIP_META[key]}</div><div class="conv">${CHIP_CONV[key] || ''}</div><div class="val" id="val-${key}"></div>`;
+    const io = STAGE_IO[key] || {};
+    const inBox = io.in ? `<div class="io-item"><span class="io-label">IN</span><span class="io-box io-kind-${io.inKind || 'sync'}">${io.in}</span></div>` : '';
+    const outBox = io.out ? `<div class="io-item"><span class="io-label">OUT</span><span class="io-box io-kind-${io.outKind || 'sync'}">${io.out}</span></div>` : '';
+    chip.innerHTML = `<div class="name">${CHIP_META[key]}</div><div class="conv">${CHIP_CONV[key] || ''}</div><div class="io-row">${inBox}${outBox}</div><div class="val" id="val-${key}"></div>`;
     chips.appendChild(chip);
     if (i < stages.length - 1) {
       const ar = document.createElement('span');
@@ -1548,7 +1600,7 @@ function renderPipelineDiagram() {
     }
   });
   const computeCount = stages.filter((k) => COMPUTE_STAGES.has(k)).length;
-  $('pipelineTitle').textContent = `Per-frame pipeline (${computeCount} compute stages)`;
+  $('pipelineTitle').textContent = `Pipeline (${computeCount} compute stages)`;
   // Only show the span label while running; keep it blank when idle.
   const spanPrefix = isInterop
     ? 'Iteration'
@@ -1736,11 +1788,11 @@ async function reportStatus() {
     probeCtx.exportToGPU(probe);
     probe.destroy();
     probeDevice.destroy();
-    log('WebNN interop: enabled (createExportableTensor + exportToGPU succeeded).', 'ok');
+    log('WebNN interop: supported.', 'ok');
     $('startBtn').disabled = false;
     $('startBtn').title = '';
   } catch (e) {
-    log(`WebNN interop: NOT available \u2014 ${e.name}: ${e.message}`, 'err');
+    log('WebNN interop: not supported.', 'err');
     disableStart(`WebNN <-> WebGPU exportable-tensor interop unavailable: ${e.name}: ${e.message}`);
   }
 }
