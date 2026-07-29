@@ -655,7 +655,6 @@ async function initML(deviceType) {
   } catch (e) {
     throw new Error(`Tensor export (WebGPU interop) unsupported on this backend: ${e.name}: ${e.message}`);
   }
-  log('WebNN <-> WebGPU exportable-tensor interop supported.', 'ok');
 }
 
 // Build the WebNN graph for a given batched shape.
@@ -807,7 +806,7 @@ async function ensureSRResources() {
   const u = new Uint32Array([SR_TILE, SR_TILE, tilesX, tilesY, frameW, frameH, 0, 0]);
   device.queue.writeBuffer(uniformBuffer, 0, u);
 
-  log(`SR resources ready: frame ${frameW}x${frameH}, tiles ${tilesX}x${tilesY} (${numTiles}), ` +
+  log(`SR resources ready: frame ${frameW}x${frameH}, ${numTiles} tiles (${tilesX}x${tilesY}) of ${SR_TILE}x${SR_TILE}, ` +
       `batch ${batch}, output ${frameW * SR_UPSCALE}x${frameH * SR_UPSCALE}.`, 'ok');
 }
 
@@ -1001,7 +1000,7 @@ async function ensureResources(profile) {
   ]);
   device.queue.writeBuffer(uniformBuffer, 0, u);
 
-  log(`Resources ready: frame ${frameW}x${frameH}, tiles ${tilesX}x${tilesY} (${numTiles}), ` +
+  log(`Resources ready: frame ${frameW}x${frameH}, ${numTiles} tiles (${tilesX}x${tilesY}) of ${profile.tileW}x${profile.tileH}, ` +
       `tensor shape [${shape.join(',')}].`, 'ok');
 
   // Reflect the real frame size (e.g. camera/file native dims) in the labels.
@@ -1239,7 +1238,7 @@ async function runLoop() {
           setChip('expIn', aeIn); setChip('wgpu', awgp); setChip('destIn', adIn); setChip('disp', adsp);
           setChip('expOut', aeOut); setChip('destOut', adOut); setChip('gpuWait', agpu);
           $('spanLabel').textContent =
-            `Iteration = ${(avgTotal / 1000).toFixed(3)} ms (avg ${ROLLING_WINDOW_MS / 1000}s) · ${(total / 1000).toFixed(3)} ms (current) (×${INTEROP_REPS})`;
+            `Iteration = ${(avgTotal / 1000).toFixed(1)} ms (avg ${ROLLING_WINDOW_MS / 1000}s) · ${(total / 1000).toFixed(1)} ms (current) (×${INTEROP_REPS})`;
           updateTotalsInfo({ webgpuUs: awgp, webnnUs: adsp, transferUs: transferSum, ioUs: agpu });
           frames = 0; expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
         }
@@ -1350,7 +1349,7 @@ async function start() {
     offlineYieldCounter = 0;
     updateTotalsInfo();
     renderPipelineDiagram();
-    log(`Running (rolling avg window: ${ROLLING_WINDOW_MS / 1000}s).`, 'ok');
+    log('Running.', 'ok');
     runLoop();
   } catch (e) {
     log(`${e.name}: ${e.message}`, 'err');
@@ -1541,10 +1540,7 @@ function renderTileViz() {
   p.push(`<rect x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" fill="none" stroke="#33373d"/>`);
   svg.innerHTML = p.join('');
 
-  const isSR = $('profileSel').value === 'SR';
-  const batch = isSR ? ` \u00b7 batch ${numTiles * CHANNELS} (3\u00d7${numTiles} B/G/R planes)` : '';
-  $('tileCaption').textContent =
-    `${frameW}\u00d7${frameH} \u2192 ${numTiles} tiles (${tilesX}\u00d7${tilesY}) of ${tw}\u00d7${th}${batch}`;
+  $('tileCaption').textContent = `${frameW}\u00d7${frameH}`;
 }
 // Rewrite the Model format option labels so the batch dim N shows the actual
 // tile count for the current frame size (native video size if playing, else the
