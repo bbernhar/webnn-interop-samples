@@ -164,10 +164,11 @@
         <option value="interop">Interop only</option>
       </select>
     </label>
-    <label title="Choose the WebNN graph for the full video pipeline: Pass-through or ESPCN SR.">WebNN graph
+    <label title="Choose the WebNN graph: Pass-through, ESPCN SR (full pipeline only), or None (skips the dispatch call to isolate pipeline overhead).">WebNN graph
       <select id="dispatchSel">
         <option value="pass" selected>Pass-through</option>
         <option value="sr">ESPCN SR</option>
+        <option value="none">None</option>
       </select>
     </label>
     <label title="Full pipeline pacing mode: rAF (display-paced) or No rAF (unpaced). Interop-only always waits onSubmittedWorkDone.">Frame completion
@@ -1054,7 +1055,8 @@ function processFrame(profile) {
 
   // --- 3) Run the WebNN graph (single dispatch per frame). --------------------
   const tDisp0 = performance.now();
-  mlContext.dispatch(mlGraph, { input: inputTensor }, { output: outputTensor });
+  if ($('dispatchSel').value !== 'none')
+    mlContext.dispatch(mlGraph, { input: inputTensor }, { output: outputTensor });
   metrics.webnnMs += performance.now() - tDisp0;
 
   // --- 4) Export WebNN output tensor -> GPUBuffer; render straight to canvas. -
@@ -1139,7 +1141,8 @@ async function measureInterop(reps, profile) {
     inBuf.destroy(); // ownership -> WebNN
     const c = performance.now(); destInMs += c - w;
 
-    mlContext.dispatch(mlGraph, { input: inputTensor }, { output: outputTensor });
+    if ($('dispatchSel').value !== 'none')
+      mlContext.dispatch(mlGraph, { input: inputTensor }, { output: outputTensor });
     const d = performance.now(); dispMs += d - c;
 
     const outBuf = mlContext.exportToGPU(outputTensor);
@@ -1417,9 +1420,11 @@ const STAGE_IO = {
   gpuWait: { in: 'Queue work', inKind: 'sync', out: 'Completed', outKind: 'sync' },
 };
 const PIPELINE_STAGES = {
-  interop: ['expIn', 'wgpu', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
-  pass:    ['import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
-  sr:      ['import', 'expIn', 'pre', 'destIn', 'dispSR', 'expOut', 'render', 'destOut', 'present'],
+  interop:     ['expIn', 'wgpu', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
+  interopNone: ['expIn', 'wgpu', 'destIn', 'expOut', 'destOut', 'gpuWait'],
+  pass:        ['import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
+  sr:          ['import', 'expIn', 'pre', 'destIn', 'dispSR', 'expOut', 'render', 'destOut', 'present'],
+  none:        ['import', 'expIn', 'pre', 'destIn', 'expOut', 'render', 'destOut', 'present'],
 };
 const STAGE_DOMAIN = {
   present: 'io',
@@ -1575,7 +1580,9 @@ function renderPipelineDiagram() {
   const isInterop = pipelineMode === 'interop';
   // Interop has its own pipeline (handshake micro-benchmark); full / SR share the
   // video pipeline layout.
-  const modeKey = isInterop ? 'interop' : dispatchMode;
+  const modeKey = isInterop
+    ? ($('dispatchSel').value === 'none' ? 'interopNone' : 'interop')
+    : dispatchMode;
   const stages = [...(PIPELINE_STAGES[modeKey] || PIPELINE_STAGES.pass)];
   const chips = $('chips');
   chips.innerHTML = '';
@@ -1621,15 +1628,20 @@ function updateSourceUI() {
 }
 // Model format and WebNN graph are two views of the same choice (SR model <->
 // ESPCN SR dispatch). Keep both enabled in Full mode and sync them, rather than
-// disabling both (which would lock the user out). Interop is passthrough-only.
+// disabling both (which would lock the user out). Interop allows Pass-through
+// or None but not SR.
 function updateDispatchUI() {
   const isInterop = $('pipelineSel').value === 'interop';
   $('flushSel').disabled = isInterop;
-  $('dispatchSel').disabled = isInterop;
+  $('dispatchSel').disabled = false;
   $('profileSel').disabled = false;
 
+  // Disable the SR option in interop mode (SR graph is full-pipeline only).
+  const srOption = [...$('dispatchSel').options].find((o) => o.value === 'sr');
+  if (srOption) srOption.disabled = isInterop;
+
   if (isInterop) {
-    // Interop runs a passthrough micro-benchmark; SR is not applicable.
+    // Interop does not support the SR model or dispatch.
     if ($('profileSel').value === 'SR') {
       $('profileSel').value = PROFILES[lastNonSrProfile] ? lastNonSrProfile : 'C';
     }
