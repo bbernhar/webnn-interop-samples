@@ -177,12 +177,24 @@
         <option value="offline" title="Unpaced: no requestAnimationFrame wait; periodic GPU drains keep the queue bounded.">No rAF</option>
       </select>
     </label>
-    <label title="Frame resolution for the test pattern and the requested camera capture size (the camera snaps to its nearest supported mode). A local file uses its own native resolution.">Source resolution
+    <label title="Frame resolution for the test pattern and the requested camera capture size (the camera snaps to its nearest supported mode). A local file uses its own native resolution.">Input resolution
       <select id="resSel">
-        <option value="640x360">640 &times; 360</option>
-        <option value="1280x720" selected>1280 &times; 720</option>
-        <option value="1920x1080">1920 &times; 1080</option>
-        <option value="3840x2160">3840 &times; 2160</option>
+        <option value="426x240">240p</option>
+        <option value="640x360">360p</option>
+        <option value="854x480">480p</option>
+        <option value="1280x720" selected>720p</option>
+        <option value="1920x1080">1080p</option>
+        <option value="2560x1440">1440p</option>
+        <option value="3840x2160">2160p</option>
+      </select>
+    </label>
+    <label title="Canvas output size for the benchmark render path. The computed SR output is shown as a p label; 4K is intended for offline video processing.">Output resolution
+      <select id="outSel">
+        <option value="854x480">480p</option>
+        <option value="1280x720" selected>720p</option>
+        <option value="1920x1080">1080p</option>
+        <option value="2560x1440">1440p</option>
+        <option value="3840x2160">2160p</option>
       </select>
     </label>
     <label>Source
@@ -282,6 +294,13 @@ const PROFILES = {
   B: { name: 'B', tileH: 400, tileW: 400, layout: LAYOUT.HWC, dataType: 'float32' },
   C: { name: 'C', tileH: 256, tileW: 288, layout: LAYOUT.HWC, dataType: 'float32' },
 };
+const OUTPUT_PRESETS = {
+  '854x480': { w: 854, h: 480 },
+  '1280x720': { w: 1280, h: 720 },
+  '1920x1080': { w: 1920, h: 1080 },
+  '2560x1440': { w: 2560, h: 1440 },
+  '3840x2160': { w: 3840, h: 2160 },
+};
 const CHANNELS = 3;
 
 // Embedded SR-10 tensor metadata.
@@ -342,6 +361,9 @@ let geom = null; // { frameW, frameH, tilesX, tilesY, numTiles, profile }
 
 const srcVideo = $('srcVideo');
 const outCanvas = $('outCanvas');
+const outSel = $('outSel');
+let outputFollowsSource = true;
+const DYNAMIC_SR_OUTPUT_VALUE = 'sr-output';
 
 // Per-window display bookkeeping.
 let frames = 0, lastFpsTime = 0;
@@ -363,6 +385,8 @@ struct Params {
   tilesY : u32,
   frameW : u32,
   frameH : u32,
+  outW   : u32,
+  outH   : u32,
   layoutMode : u32, // 0 = HWC, 1 = CHW
   _pad   : u32,
 };
@@ -433,13 +457,16 @@ fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
 fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
   let px = u32(fragCoord.x);
   let py = u32(fragCoord.y);
-  if (px >= p.frameW || py >= p.frameH) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  if (px >= p.outW || py >= p.outH) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+
+  let srcX = min((px * p.frameW) / p.outW, p.frameW - 1u);
+  let srcY = min((py * p.frameH) / p.outH, p.frameH - 1u);
 
   // Map the canvas pixel back to its tile + in-tile coordinate.
-  let tileX = px / p.tileW;
-  let tileY = py / p.tileH;
-  let gx = px % p.tileW;
-  let gy = py % p.tileH;
+  let tileX = srcX / p.tileW;
+  let tileY = srcY / p.tileH;
+  let gx = srcX % p.tileW;
+  let gy = srcY % p.tileH;
   let tile = tileY * p.tilesX + tileX;
 
   let plane = p.tileW * p.tileH;
@@ -598,7 +625,7 @@ async function initGPU() {
   gpuContext.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
 
   uniformBuffer = device.createBuffer({
-    size: 32, // 8 x u32
+    size: 40, // 10 x u32
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -804,7 +831,7 @@ async function ensureSRResources() {
     { dataType: 'float32', shape: [batch, 1, SR_OUT, SR_OUT] }, device);
 
   // Uniforms: SR uses fixed 224x224 tiles; layoutMode unused.
-  const u = new Uint32Array([SR_TILE, SR_TILE, tilesX, tilesY, frameW, frameH, 0, 0]);
+  const u = new Uint32Array([SR_TILE, SR_TILE, tilesX, tilesY, frameW, frameH, frameW * SR_UPSCALE, frameH * SR_UPSCALE, 0, 0]);
   device.queue.writeBuffer(uniformBuffer, 0, u);
 
   log(`SR resources ready: frame ${frameW}x${frameH}, ${numTiles} tiles (${tilesX}x${tilesY}) of ${SR_TILE}x${SR_TILE}, ` +
@@ -930,7 +957,7 @@ async function startSyntheticSource() {
 }
 
 async function startCameraSource() {
-  // Request the selected Source resolution as the camera capture size (the
+  // Request the selected Input resolution as the camera capture size (the
   // browser snaps to the nearest mode the camera actually supports).
   const { w, h } = getResolution();
   mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -969,6 +996,7 @@ async function ensureResources(profile) {
   const res = getResolution();
   const frameW = srcVideo.videoWidth || res.w;
   const frameH = srcVideo.videoHeight || res.h;
+  const output = getOutputResolution();
 
   if (geom && geom.frameW === frameW && geom.frameH === frameH &&
       geom.profile === profile.name) {
@@ -980,11 +1008,9 @@ async function ensureResources(profile) {
   const numTiles = tilesX * tilesY;
   geom = { frameW, frameH, tilesX, tilesY, numTiles, profile: profile.name };
 
-  // Output canvas matches the composed frame resolution (output tile == input
-  // tile for this same-resolution enhancement graph); the render pass bilinearly
-  // scales it to whatever CSS/backbuffer size the canvas presents.
-  outCanvas.width = frameW;
-  outCanvas.height = frameH;
+  // Output canvas follows the selected benchmark output preset.
+  outCanvas.width = output.w;
+  outCanvas.height = output.h;
 
   // (Re)build the WebNN graph and exportable tensor pair for this batch size.
   if (inputTensor) inputTensor.destroy();
@@ -997,7 +1023,7 @@ async function ensureResources(profile) {
 
   // Upload uniforms.
   const u = new Uint32Array([
-    profile.tileW, profile.tileH, tilesX, tilesY, frameW, frameH, profile.layout, 0,
+    profile.tileW, profile.tileH, tilesX, tilesY, frameW, frameH, output.w, output.h, profile.layout, 0,
   ]);
   device.queue.writeBuffer(uniformBuffer, 0, u);
 
@@ -1464,6 +1490,61 @@ function getResolution() {
   const [w, h] = $('resSel').value.split('x').map(Number);
   return { w, h };
 }
+function getOutputResolution() {
+  return OUTPUT_PRESETS[outSel.value] || OUTPUT_PRESETS['1280x720'];
+}
+function toPLabel(w, h) {
+  return `${h}p`;
+}
+function setDynamicSROutput(sourceW, sourceH) {
+  const targetW = sourceW * SR_UPSCALE;
+  const targetH = sourceH * SR_UPSCALE;
+  const label = toPLabel(targetW, targetH);
+  let option = [...outSel.options].find((o) => o.value === DYNAMIC_SR_OUTPUT_VALUE);
+  if (!option) {
+    option = document.createElement('option');
+    option.value = DYNAMIC_SR_OUTPUT_VALUE;
+    outSel.appendChild(option);
+  }
+  option.textContent = label;
+  outSel.value = DYNAMIC_SR_OUTPUT_VALUE;
+  outSel.title = `Computed SR output: ${label}`;
+}
+function clearDynamicSROutput() {
+  const option = [...outSel.options].find((o) => o.value === DYNAMIC_SR_OUTPUT_VALUE);
+  if (option) option.remove();
+  outSel.title = 'Canvas output size for the benchmark render path. 4K is intended for offline video processing.';
+}
+function syncOutputToSource() {
+  if (!outputFollowsSource) return;
+  const activeSource = getActiveSourceResolution();
+  const isSR = $('dispatchSel').value === 'sr';
+  if (activeSource) {
+    if (isSR) {
+      setDynamicSROutput(activeSource.w, activeSource.h);
+      return;
+    }
+    const scale = 1;
+    const key = `${activeSource.w * scale}x${activeSource.h * scale}`;
+    if (OUTPUT_PRESETS[key]) {
+      outSel.value = key;
+      return;
+    }
+  }
+  const sourceValue = $('resSel').value;
+  const sourceRes = sourceValue.split('x').map(Number);
+  if (sourceRes.length === 2) {
+    const scale = isSR ? SR_UPSCALE : 1;
+    const key = `${sourceRes[0] * scale}x${sourceRes[1] * scale}`;
+    if (OUTPUT_PRESETS[key]) {
+      outSel.value = key;
+      return;
+    }
+  }
+  if (OUTPUT_PRESETS[sourceValue] && !isSR) {
+    outSel.value = sourceValue;
+  }
+}
 function formatResolution(w, h) {
   return `${w}x${h}`;
 }
@@ -1490,8 +1571,13 @@ function updateResolutionInfo() {
     targetText = 'n/a (no present)';
   } else if (dispatchMode === 'sr') {
     targetText = srcRes
-      ? formatResolution(srcRes.w * SR_UPSCALE, srcRes.h * SR_UPSCALE)
+      ? toPLabel(srcRes.w * SR_UPSCALE, srcRes.h * SR_UPSCALE)
       : `${SR_UPSCALE}x source (pending)`;
+    if (srcRes) setDynamicSROutput(srcRes.w, srcRes.h);
+  } else {
+    clearDynamicSROutput();
+    const outRes = getOutputResolution();
+    targetText = formatResolution(outRes.w, outRes.h);
   }
 
   const targetEl = $('targetInfo');
@@ -1624,7 +1710,14 @@ function updateSourceUI() {
   // The Source preview is only informative for real inputs (camera / file); the
   // test pattern is self-generated, so hide its (redundant) preview.
   $('sourceFigure').style.display = src === 'test' ? 'none' : '';
+  syncOutputToSource();
+  updateOutputUI();
   updateResolutionInfo();
+}
+function updateOutputUI() {
+  const isInterop = $('pipelineSel').value === 'interop';
+  const isSR = $('dispatchSel').value === 'sr';
+  outSel.disabled = isInterop || isSR;
 }
 // Model format and WebNN graph are two views of the same choice (SR model <->
 // ESPCN SR dispatch). Keep both enabled in Full mode and sync them, rather than
@@ -1649,13 +1742,16 @@ function updateDispatchUI() {
   }
 
   $('stage').style.display = isInterop ? 'none' : '';
-  // Interop sizes its tensors by the Source resolution (ignoring the source), and
+  // Interop sizes its tensors by the Input resolution (ignoring the source), and
   // camera/test use it too; only a local file has a fixed native size.
   $('resSel').disabled = !isInterop && $('sourceSel').value === 'file';
+  updateOutputUI();
   updateResolutionInfo();
 }
 $('sourceSel').addEventListener('change', updateSourceUI);
 $('pipelineSel').addEventListener('change', () => { updateDispatchUI(); renderPipelineDiagram(); });
+$('outSel').addEventListener('change', () => { outputFollowsSource = false; geom = null; updateResolutionInfo(); });
+$('resSel').addEventListener('change', () => { outputFollowsSource = true; syncOutputToSource(); geom = null; updateResolutionInfo(); });
 $('dispatchSel').addEventListener('change', () => {
   // Sync the Model format to match: ESPCN SR <-> SR model, pass-through <-> A/B/C.
   if ($('dispatchSel').value === 'sr') {
@@ -1664,6 +1760,7 @@ $('dispatchSel').addEventListener('change', () => {
   } else if ($('profileSel').value === 'SR') {
     $('profileSel').value = PROFILES[lastNonSrProfile] ? lastNonSrProfile : 'C';
   }
+  syncOutputToSource();
   updateDispatchUI();
   renderPipelineDiagram();
   renderTileViz();
@@ -1707,21 +1804,64 @@ const URL_PARAMS = {
   pipeline:   'pipelineSel',
   graph:      'dispatchSel',
   completion: 'flushSel',
-  res:        'resSel',
+  input:      'resSel',
+  output:     'outSel',
   source:     'sourceSel',
 };
+const URL_PARAM_ALIASES = {
+  input: ['inputres', 'res'],
+};
+const P_LABEL_TO_VALUE = {
+  '240p': '426x240',
+  '360p': '640x360',
+  '480p': '854x480',
+  '720p': '1280x720',
+  '1080p': '1920x1080',
+  '1440p': '2560x1440',
+  '2160p': '3840x2160',
+};
+function resolutionValueToLabel(value) {
+  if (value === DYNAMIC_SR_OUTPUT_VALUE) {
+    const source = getActiveSourceResolution();
+    if (source) return `${source.h * SR_UPSCALE}p`;
+    return 'sr';
+  }
+  const [w, h] = String(value).split('x').map(Number);
+  if (!Number.isFinite(h)) return String(value);
+  return `${h}p`;
+}
+function resolutionLabelToValue(label) {
+  return P_LABEL_TO_VALUE[String(label).toLowerCase()] || label;
+}
+function getURLParamValue(q, key) {
+  const names = [key, ...(URL_PARAM_ALIASES[key] || [])];
+  for (const name of names) {
+    const value = q.get(name);
+    if (value != null) return value;
+  }
+  return null;
+}
 function applyConfigFromURL() {
   const q = new URLSearchParams(location.search);
   for (const [key, id] of Object.entries(URL_PARAMS)) {
-    const val = q.get(key);
+    const val = getURLParamValue(q, key);
     if (val == null) continue;
     const el = $(id);
-    if (el && [...el.options].some((o) => o.value === val)) el.value = val;
+    const normalized = id === 'resSel' || id === 'outSel' ? resolutionLabelToValue(val) : val;
+    if (el && [...el.options].some((o) => o.value === normalized)) {
+      el.value = normalized;
+    } else if (id === 'outSel' && /\d+p$/i.test(String(val))) {
+      const src = getResolution();
+      setDynamicSROutput(src.w, src.h);
+    }
   }
 }
 function syncURLFromConfig() {
   const q = new URLSearchParams();
-  for (const [key, id] of Object.entries(URL_PARAMS)) q.set(key, $(id).value);
+  for (const [key, id] of Object.entries(URL_PARAMS)) {
+    const value = $(id).value;
+    q.set(key, id === 'resSel' || id === 'outSel' ? resolutionValueToLabel(value) : value);
+  }
   const auto = new URLSearchParams(location.search).get('autostart');
   if (auto != null) q.set('autostart', auto);
   history.replaceState(null, '', `${location.pathname}?${q.toString()}`);
