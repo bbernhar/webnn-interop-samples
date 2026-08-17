@@ -1928,7 +1928,8 @@ async function reportStatus() {
     const probeAdapter = await navigator.gpu.requestAdapter();
     if (!probeAdapter) throw new Error('no WebGPU adapter');
     const probeDevice = await probeAdapter.requestDevice();
-    const probeCtx = await navigator.ml.createContext({ deviceType: 'gpu' });
+    const selectedDevice = $('deviceSel').value;
+    const probeCtx = await navigator.ml.createContext({ deviceType: selectedDevice });
     const probe = await probeCtx.createExportableTensor(
       { dataType: 'float32', shape: [1] }, probeDevice);
     probeCtx.exportToGPU(probe);
