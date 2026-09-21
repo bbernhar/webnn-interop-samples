@@ -2,8 +2,8 @@
 
 Samples are organized by workload, one folder per sample:
 
-- `super_resolution/`
-  - `super_resolution.html`
+- `super_resolution_10/`
+  - `super_resolution_10.html`
   - `README.md`
 - `webgpu_stress/`
   - `webgpu_stress.html`
@@ -12,7 +12,7 @@ Samples are organized by workload, one folder per sample:
 ## Hosted Demos (GitHub Pages)
 
 Run the workloads directly in a browser from the hosted pages:
-- Super Resolution: https://bbernhar.github.io/webnn-interop-samples/super_resolution/super_resolution.html
+- Super Resolution 10: https://bbernhar.github.io/webnn-interop-samples/super_resolution_10/super_resolution_10.html
 - WebGPU Stress: https://bbernhar.github.io/webnn-interop-samples/webgpu_stress/webgpu_stress.html
 
 ## Requirements
