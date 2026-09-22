@@ -1,0 +1,1438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebNN SSR Benchmark</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    padding: 16px 20px;
+    font-family: system-ui, Segoe UI, Arial, sans-serif;
+    background: #14161a;
+    color: #e8eaed;
+  }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  #controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  #controls label { font-size: 13px; display: inline-flex; gap: 6px; align-items: center; }
+  #resInfo { font-size: 12px; color: #9aa0a6; }
+  select, button, input[type=file] { font-size: 13px; padding: 6px 8px; }
+  select:disabled { opacity: 0.45; cursor: not-allowed; }
+  button { cursor: pointer; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  #stage { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+  figure { margin: 0; }
+  figcaption { font-size: 12px; color: #9aa0a6; margin-bottom: 4px; }
+  canvas, video { background: #000; border: 1px solid #33373d; }
+  #srcVideo {
+    width: min(34vw, 520px);
+    height: auto;
+  }
+  #outCanvas {
+    width: min(62vw, 980px);
+    max-width: 100%;
+    height: auto;
+  }
+  #log {
+    margin-top: 12px; font-size: 12px; white-space: pre-wrap;
+    background: #1c1f24; border: 1px solid #33373d; border-radius: 6px;
+    padding: 10px; max-height: 180px; overflow: auto; font-family: Consolas, monospace;
+  }
+  .stat { font-variant-numeric: tabular-nums; }
+  .err { color: #ff8a80; }
+  .ok { color: #a5d6a7; }
+
+  /* Pipeline diagram */
+  #pipeline { margin: 4px 0 18px; overflow-x: auto; }
+  .pipeline-title { font-size: 13px; font-weight: 600; color: #e8eaed; margin-bottom: 8px; }
+  .chips { display: flex; align-items: stretch; flex-wrap: nowrap; width: max-content; }
+  .chip {
+    background: #1c1f24; border: 1px solid #33373d; border-radius: 6px;
+    padding: 9px 11px; min-width: 120px; text-align: center;
+  }
+  .chip.domain-webgpu { border-color: #4c8df6; background: #162338; }
+  .chip.domain-webnn { border-color: #3fbf7f; background: #13281f; }
+  .chip.domain-transfer { border-color: #f2ad4f; background: #2d2313; }
+  .chip.domain-io { border-color: #7d8692; background: #1d2127; }
+  .chip .name { font-size: 13px; color: #cdd2d7; white-space: pre-line; line-height: 1.2; }
+  .chip .conv { font-size: 12px; color: #9aa0a6; margin-top: 5px; white-space: pre-line; line-height: 1.15; min-height: 28px; }
+  .chip .io-row {
+    margin-top: 7px;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .chip .io-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .chip .io-label {
+    font-size: 10px;
+    color: #9aa0a6;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    flex: 0 0 auto;
+  }
+  .chip .io-box {
+    font-size: 10px;
+    line-height: 1.2;
+    border-radius: 4px;
+    padding: 2px 6px;
+    border: 1px solid #4a515a;
+    color: #d8dde3;
+    background: #252a31;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chip .io-kind-video { border-color: #7d8692; background: #242930; }
+  .chip .io-kind-texture { border-color: #6f90cf; background: #1c2940; }
+  .chip .io-kind-tensor { border-color: #5eae8b; background: #1a2d25; }
+  .chip .io-kind-buffer { border-color: #d8a661; background: #322714; }
+  .chip .io-kind-canvas { border-color: #7cb7d9; background: #173042; }
+  .chip .io-kind-display { border-color: #a785d3; background: #2a2140; }
+  .chip .io-kind-sync { border-color: #8c98a5; background: #2b3038; }
+  .chip .val { font-size: 15px; font-variant-numeric: tabular-nums; color: #a5d6a7; margin-top: 6px; min-height: 19px; }
+  .chip .batch { font-size: 11px; color: #9aa0a6; margin-top: 3px; }
+  .arrow { align-self: center; color: #6b7178; padding: 0 8px; font-size: 18px; }
+  .spanbar {
+    position: relative; height: 24px; margin-top: 6px;
+    border-top: 2px solid #5c9ded; border-left: 2px solid #5c9ded; border-right: 2px solid #5c9ded;
+    width: max-content; min-width: 100%;
+  }
+  .span-label {
+    position: absolute; top: 5px; left: 50%; transform: translateX(-50%);
+    font-size: 14px; color: #9ecbff; white-space: nowrap; background: #14161a; padding: 0 8px;
+  }
+  .legend { margin-top: 10px; font-size: 13px; color: #9aa0a6; display: inline-flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .legend .swatch {
+    width: 12px; height: 12px; border-radius: 3px;
+    display: inline-block; flex: 0 0 auto;
+  }
+  .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .swatch-webgpu { background: #4c8df6; }
+  .legend .swatch-webnn { background: #3fbf7f; }
+  .legend .swatch-transfer { background: #f2ad4f; }
+  .legend .swatch-io { background: #7d8692; }
+
+  /* Frame tiling schematic */
+  #tileViz { margin: 4px 0 18px; }
+  #tileViz svg { display: block; }
+  #tileCaption { font-size: 12px; color: #9aa0a6; font-variant-numeric: tabular-nums; }
+  .section-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .section-head .pipeline-title { margin-bottom: 0; }
+</style>
+</head>
+<body>
+  <h1>WebNN SSR Benchmark</h1>
+
+  <div id="controls">
+    <label>WebNN device
+      <select id="deviceSel">
+        <option value="gpu" selected>gpu</option>
+        <option value="npu">npu</option>
+      </select>
+    </label>
+    <label title="WebGPU adapter power preference: high-performance usually selects a discrete GPU, low-power the integrated one; fallback selects the software adapter">WebGPU adapter
+      <select id="gpuSel">
+        <option value="default" selected>default</option>
+        <option value="high-performance">high-performance</option>
+        <option value="low-power">low-power</option>
+        <option value="fallback">fallback (software)</option>
+      </select>
+    </label>
+    <label title="Choose whether to run the full video pipeline or interop-only micro-benchmark.">Pipeline
+      <select id="pipelineSel">
+        <option value="full" selected>Full</option>
+        <option value="interop">Interop only</option>
+      </select>
+    </label>
+    <label title="Full pipeline pacing mode: rAF (display-paced) or No rAF (unpaced). Interop-only always waits onSubmittedWorkDone.">Frame completion
+      <select id="flushSel">
+        <option value="off" selected title="Display-paced: waits for requestAnimationFrame each cycle.">rAF</option>
+        <option value="offline" title="Unpaced: no requestAnimationFrame wait; periodic GPU drains keep the queue bounded.">No rAF</option>
+      </select>
+    </label>
+    <label title="Frame resolution for the test pattern and the requested camera capture size (the camera snaps to its nearest supported mode). A local file uses its own native resolution.">Input resolution
+      <select id="resSel">
+        <option value="426x240">240p</option>
+        <option value="640x360">360p</option>
+        <option value="854x480">480p</option>
+        <option value="1280x720" selected>720p</option>
+        <option value="1920x1080">1080p</option>
+        <option value="2560x1440">1440p</option>
+        <option value="3840x2160">2160p</option>
+      </select>
+    </label>
+    <label>Source
+      <select id="sourceSel">
+        <option value="test" selected>Test pattern</option>
+        <option value="camera">Camera</option>
+        <option value="file">Local file…</option>
+      </select>
+    </label>
+    <input type="file" id="fileInput" accept="video/*" style="display:none">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <button id="copyLinkBtn" title="Copy a shareable URL that reproduces the current configuration">Copy link</button>
+  </div>
+
+  <div id="pipeline">
+    <div class="pipeline-title" id="pipelineTitle">Pipeline</div>
+    <div class="chips" id="chips"></div>
+    <div class="spanbar"><span class="span-label" id="spanLabel"></span></div>
+    <div class="legend">
+      <span class="legend-item"><span class="swatch swatch-webgpu"></span> <span id="legendWebgpu">WebGPU compute/render</span></span>
+      <span class="legend-item"><span class="swatch swatch-webnn"></span> <span id="legendWebnn">WebNN dispatch</span></span>
+      <span class="legend-item"><span class="swatch swatch-transfer"></span> <span id="legendTransfer">Tensor transfer</span></span>
+      <span class="legend-item"><span class="swatch swatch-io"></span> <span id="legendIo">Video/Present/Wait</span></span>
+      <span class="legend-item">Per-stage timings are CPU wall-time, averaged.</span>
+    </div>
+  </div>
+
+  <div id="tileViz">
+    <div class="section-head">
+      <span class="pipeline-title">Frame</span>
+      <span id="tileCaption" class="stat"></span>
+    </div>
+    <svg id="tileSvg" width="0" height="0" aria-hidden="true"></svg>
+  </div>
+
+  <div id="stage">
+    <figure id="sourceFigure">
+      <figcaption>Source (decoded input) <span id="sourceInfo" class="stat"></span></figcaption>
+      <video id="srcVideo" width="480" height="270" muted playsinline loop></video>
+    </figure>
+    <figure>
+      <figcaption>Output (WebNN result, WebGPU render) <span id="targetInfo" class="stat"></span></figcaption>
+      <canvas id="outCanvas" width="1280" height="720"></canvas>
+    </figure>
+  </div>
+
+  <div id="log"></div>
+
+<script type="module">
+// =============================================================================
+// WebNN + WebGPU Super Resolution benchmark.
+//
+// Measures the per-frame latency of the WebGPU <-> WebNN exportable-tensor
+// interop path (single WebGPU submit per stage, single WebNN dispatch/frame):
+//
+//   VideoFrame -> GPUExternalTexture
+//        -> [preprocess.wgsl]  tile + BGR swizzle + layout pack -> exported input buffer
+//        -> ml.exportToGPU(inTensor) / gpuBuffer.destroy()  (ownership handoff)
+//        -> ml.dispatch(graph, {input}, {output})           (WebNN dispatch)
+//        -> ml.exportToGPU(outTensor)
+//        -> [render.wgsl]      read output buffer directly: BGR->RGBA +
+//                              tile de-stitch -> canvas (no intermediate copy)
+//
+// The WebNN graph reconstructs the analyzed FP16 SSR topology. Tiling, channel
+// order (BGR), and NCHW memory layout match the model contract.
+// =============================================================================
+
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+function log(msg, cls) {
+  const t = new Date().toLocaleTimeString();
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `[${t}] ${msg}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function pushRollingSample(bucket, sample, now) {
+  bucket.push(sample);
+  const cutoff = now - ROLLING_WINDOW_MS;
+  while (bucket.length && bucket[0].t < cutoff) bucket.shift();
+}
+
+const CHANNELS = 3;
+
+// -----------------------------------------------------------------------------
+// Global state.
+// -----------------------------------------------------------------------------
+let adapter, device, gpuContext, canvasFormat;
+let currentAdapterKey = null; // tracks the powerPreference/fallback the device was created with
+let mlContext = null;
+let interopPipeline;
+let srGraph = null;
+let srInputTensor = null, srOutputTensor = null;
+let srPreprocPipeline, srRenderPipeline;
+let srGeom = null; // { frameW, frameH, tilesX, tilesY, numTiles, batch }
+const SR_TILE_H = 240;
+const SR_TILE_W = 360;
+const SR_UPSCALE = 3;
+const SR_OUT_H = SR_TILE_H * SR_UPSCALE;
+const SR_OUT_W = SR_TILE_W * SR_UPSCALE;
+let uniformBuffer = null;
+let scratchBuffer = null;
+
+// Repetitions per sample in interop-only mode (amortizes call + timer noise).
+const INTEROP_REPS = 64;
+// Rolling average window for the displayed "avg" metrics.
+const ROLLING_WINDOW_MS = 5000;
+
+let running = false;
+let rafId = 0;
+let mediaStream = null;
+
+const srcVideo = $('srcVideo');
+const outCanvas = $('outCanvas');
+
+// Per-window display bookkeeping.
+let frames = 0, lastFpsTime = 0;
+// Interop-only per-call accumulators (per cycle, ms).
+let expInSum = 0, wgpuSum = 0, expOutSum = 0, destInSum = 0, destOutSum = 0, dispSum = 0, gpuWaitSum = 0;
+let interopSamples = [];
+let frameSamples = [];
+let offlineYieldCounter = 0;
+
+// =============================================================================
+// WGSL shaders (parameterized at runtime via a uniform block).
+// =============================================================================
+const UNIFORM_WGSL = `
+struct Params {
+  tileW  : u32,
+  tileH  : u32,
+  tilesX : u32,
+  tilesY : u32,
+  frameW : u32,
+  frameH : u32,
+  outW   : u32,
+  outH   : u32,
+};
+`;
+
+// Interop compute: a trivial WebGPU compute pass over the exported tensor
+// buffer (stands in for the preprocess/postprocess a real app would run on the
+// shared buffer while it owns it), so the interop cycle exercises actual WebGPU
+// work on the tensor rather than exporting and immediately handing it back.
+const INTEROP_COMPUTE_WGSL = `
+enable f16;
+@group(0) @binding(0) var<storage, read_write> buf : array<f16>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(num_workgroups) nwg : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  // Linearize a 2D workgroup grid so large tensors stay within the
+  // maxComputeWorkgroupsPerDimension limit at high resolutions.
+  let wg = wid.x + wid.y * nwg.x;
+  let i = wg * 256u + lid.x;
+  if (i >= arrayLength(&buf)) { return; }
+  buf[i] = buf[i];
+}
+`;
+
+// SSR preprocess: sample each 240x360 tile into the exported FP16 tensor.
+const SR_PREPROCESS_WGSL = UNIFORM_WGSL + `
+enable f16;
+@group(0) @binding(0) var extTex : texture_external;
+@group(0) @binding(1) var<storage, read_write> ioBuf : array<f16>;
+@group(0) @binding(2) var<uniform> p : Params;
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let gx = gid.x;
+  let gy = gid.y;
+  let tile = gid.z;
+  if (gx >= p.tileW || gy >= p.tileH || tile >= p.tilesX * p.tilesY) { return; }
+
+  let tileX = tile % p.tilesX;
+  let tileY = tile / p.tilesX;
+  let srcY = min(tileY * p.tileH + gy, p.frameH - 1u);
+  let srcX = min(tileX * p.tileW + gx, p.frameW - 1u);
+  let rgb = textureLoad(extTex, vec2<i32>(i32(srcX), i32(srcY))).rgb;
+
+  let plane = p.tileW * p.tileH;
+  let pixel = gy * p.tileW + gx;
+  // Batch layout: element (tile*3 + channel), channel order B, G, R.
+  ioBuf[(tile * 3u + 0u) * plane + pixel] = f16(rgb.b);
+  ioBuf[(tile * 3u + 1u) * plane + pixel] = f16(rgb.g);
+  ioBuf[(tile * 3u + 2u) * plane + pixel] = f16(rgb.r);
+}
+`;
+
+// SSR postprocess: read the FP16 output, recombine BGR planes, and render
+// rectangular 720x1080 tiles directly to the 3x canvas.
+const SR_RENDER_WGSL = UNIFORM_WGSL + `
+enable f16;
+@group(0) @binding(0) var<storage, read> ioBuf : array<f16>;
+@group(0) @binding(1) var<uniform> p : Params;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0));
+  return vec4<f32>(pos[vi], 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
+  let outTileW = p.tileW * 3u;
+  let outTileH = p.tileH * 3u;
+  let outW = p.frameW * 3u;
+  let outH = p.frameH * 3u;
+  let px = u32(fragCoord.x);
+  let py = u32(fragCoord.y);
+  if (px >= outW || py >= outH) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+
+  let tileX = px / outTileW;
+  let tileY = py / outTileH;
+  let ox = px % outTileW;
+  let oy = py % outTileH;
+  let tile = tileY * p.tilesX + tileX;
+
+  let oplane = outTileW * outTileH;
+  let opix = oy * outTileW + ox;
+  let b = f32(ioBuf[(tile * 3u + 0u) * oplane + opix]);
+  let g = f32(ioBuf[(tile * 3u + 1u) * oplane + opix]);
+  let r = f32(ioBuf[(tile * 3u + 2u) * oplane + opix]);
+  return vec4<f32>(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0), 1.0);
+}
+`;
+
+// =============================================================================
+// WebGPU / WebNN initialization.
+// =============================================================================
+async function initGPU() {
+  if (!navigator.gpu) throw new Error('WebGPU not available (navigator.gpu missing).');
+
+  // Resolve the requested WebGPU adapter selection.
+  const sel = $('gpuSel').value; // 'default' | 'high-performance' | 'low-power' | 'fallback'
+  if (device && sel === currentAdapterKey) return; // reuse existing device
+
+  // Recreate the device if the adapter selection changed.
+  if (device) { device.destroy(); device = null; srGeom = null; }
+  currentAdapterKey = sel;
+
+  const options = {};
+  if (sel === 'high-performance' || sel === 'low-power') options.powerPreference = sel;
+  if (sel === 'fallback') options.forceFallbackAdapter = true;
+
+  adapter = await navigator.gpu.requestAdapter(options);
+  if (!adapter) throw new Error(`No WebGPU adapter for selection "${sel}".`);
+  // Request the adapter's max buffer/binding sizes: the real-SR output tensor
+  // Large batched SR output tensors can exceed the default binding size.
+  const requiredLimits = {};
+  if (adapter.limits) {
+    requiredLimits.maxStorageBufferBindingSize = adapter.limits.maxStorageBufferBindingSize;
+    requiredLimits.maxBufferSize = adapter.limits.maxBufferSize;
+  }
+  if (!adapter.features.has('shader-f16')) {
+    throw new Error('Selected WebGPU adapter does not support shader-f16.');
+  }
+  device = await adapter.requestDevice({
+    requiredFeatures: ['shader-f16'],
+    requiredLimits,
+  });
+  device.lost.then((info) => log(`GPU device lost: ${info.message}`, 'err'));
+  device.addEventListener('uncapturederror', (event) => {
+    log(`WebGPU error: ${event.error.message}`, 'err');
+  });
+
+  const info = adapter.info;
+  if (info) {
+    const parts = [info.vendor, info.architecture, info.description].filter(Boolean);
+    log(`WebGPU adapter [${sel}]: ${parts.join(' / ') || '(no info)'}` +
+        `${adapter.isFallbackAdapter ? ' (fallback)' : ''}`, 'ok');
+  }
+
+  gpuContext = outCanvas.getContext('webgpu');
+  canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  gpuContext.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+
+  uniformBuffer = device.createBuffer({
+    size: 32, // 8 x u32
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  // Tiny scratch buffer: a dependent GPU touch of the exported output tensor in
+  // interop-only mode, so onSubmittedWorkDone waits for the WebNN dispatch.
+  scratchBuffer = device.createBuffer({
+    size: 256,
+    usage: GPUBufferUsage.COPY_DST,
+  });
+
+  const interopModule = device.createShaderModule({ code: INTEROP_COMPUTE_WGSL });
+  const preprocessModule = device.createShaderModule({ code: SR_PREPROCESS_WGSL });
+  const renderModule = device.createShaderModule({ code: SR_RENDER_WGSL });
+  for (const [name, module] of [
+      ['interop', interopModule],
+      ['preprocess', preprocessModule],
+      ['render', renderModule],
+  ]) {
+    const info = await module.getCompilationInfo();
+    for (const message of info.messages) {
+      log(`${name} shader ${message.type}: ${message.message}`,
+          message.type === 'error' ? 'err' : '');
+    }
+  }
+
+  interopPipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: interopModule, entryPoint: 'main' },
+  });
+
+  // BGR-plane pack -> SSR -> recombine to canvas.
+  srPreprocPipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: preprocessModule, entryPoint: 'main' },
+  });
+  srRenderPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: renderModule, entryPoint: 'vs' },
+    fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format: canvasFormat }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  log('WebGPU initialized.', 'ok');
+}
+
+async function initML(deviceType) {
+  if (!navigator.ml) throw new Error('WebNN not available (navigator.ml missing).');
+  mlContext = await navigator.ml.createContext({ deviceType });
+  log(`WebNN context created (deviceType="${deviceType}").`, 'ok');
+
+  // Probe tensor export / WebGPU interop support before committing to it.
+  try {
+    const probe = await mlContext.createExportableTensor(
+      { dataType: 'float16', shape: [2] }, device);
+    mlContext.exportToGPU(probe);
+    probe.destroy();
+  } catch (e) {
+    throw new Error(`Tensor export (WebGPU interop) unsupported on this backend: ${e.name}: ${e.message}`);
+  }
+}
+
+function createRandom(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return (state >>> 0) / 0xffffffff;
+  };
+}
+
+function randomFp16Constant(builder, random, shape, scale, bias = 0) {
+  if (typeof Float16Array === 'undefined') {
+    throw new Error('Float16Array is required for the SSR graph.');
+  }
+  const values = new Float16Array(shape.reduce((a, b) => a * b, 1));
+  for (let i = 0; i < values.length; ++i) {
+    values[i] = (random() * 2 - 1) * scale + bias;
+  }
+  return builder.constant({ dataType: 'float16', shape }, values);
+}
+
+// Rebuild the analyzed TFLite topology with deterministic random FP16 weights.
+async function buildSRGraph(batch) {
+  const b = new MLGraphBuilder(mlContext);
+  const random = createRandom(0x53535231);
+  const input = b.input('input', {
+    dataType: 'float16',
+    shape: [batch, 1, SR_TILE_H, SR_TILE_W],
+  });
+  const conv = (value, outputChannels, inputChannels, options = {}) => {
+    const weights = randomFp16Constant(
+        b, random, [outputChannels, inputChannels, 3, 3], 0.012);
+    const bias = randomFp16Constant(b, random, [outputChannels], 0.001);
+    return b.conv2d(value, weights, { bias, ...options });
+  };
+  const prelu = (value, channels) => {
+    const slope = randomFp16Constant(b, random, [1, channels, 1, 1], 0, 0.1);
+    return b.prelu(value, slope);
+  };
+  const pixelShuffle = (value, channels, height, width) => {
+    let output = b.reshape(
+        value, [batch, SR_UPSCALE, SR_UPSCALE, channels, height, width]);
+    output = b.transpose(output, { permutation: [0, 3, 4, 1, 5, 2] });
+    return b.reshape(
+        output, [batch, channels, height * SR_UPSCALE, width * SR_UPSCALE]);
+  };
+
+  const baseline = b.resample2d(input, {
+    mode: 'linear',
+    axes: [2, 3],
+    sizes: [SR_OUT_H, SR_OUT_W],
+  });
+  let value = prelu(conv(input, 32, 1, { strides: [3, 3] }), 32);
+  const block0 = value;
+  value = prelu(conv(value, 32, 32, { padding: [1, 1, 1, 1] }), 32);
+  value = prelu(conv(value, 32, 32, { padding: [1, 1, 1, 1] }), 32);
+  value = prelu(b.add(block0, value), 32);
+  const block1 = value;
+  value = prelu(conv(value, 32, 32, { padding: [1, 1, 1, 1] }), 32);
+  value = prelu(conv(value, 32, 32, { padding: [1, 1, 1, 1] }), 32);
+  value = prelu(b.add(block1, value), 32);
+  value = prelu(conv(value, 36, 32, { padding: [1, 1, 1, 1] }), 36);
+  value = pixelShuffle(value, 4, 80, 120);
+  value = prelu(conv(value, 9, 4, { padding: [1, 1, 1, 1] }), 9);
+  value = pixelShuffle(value, 1, SR_TILE_H, SR_TILE_W);
+  srGraph = await b.build({ output: b.add(baseline, value) });
+}
+
+// (Re)build the SSR graph + exportable tensors when the frame size changes.
+async function ensureSRResources() {
+  const res = getResolution();
+  const frameW = srcVideo.videoWidth || res.w;
+  const frameH = srcVideo.videoHeight || res.h;
+
+  if (srGeom && srGeom.frameW === frameW && srGeom.frameH === frameH) return;
+
+  const tilesX = Math.ceil(frameW / SR_TILE_W);
+  const tilesY = Math.ceil(frameH / SR_TILE_H);
+  const numTiles = tilesX * tilesY;
+  const batch = numTiles * CHANNELS; // one 1-channel batch element per B/G/R plane
+  srGeom = { frameW, frameH, tilesX, tilesY, numTiles, batch };
+
+  outCanvas.width = frameW * SR_UPSCALE;
+  outCanvas.height = frameH * SR_UPSCALE;
+
+  // Warn if the (large) output tensor would exceed the storage-buffer binding limit.
+  const outBytes = batch * SR_OUT_H * SR_OUT_W * 2;
+  if (outBytes > device.limits.maxStorageBufferBindingSize) {
+    log(`SR output buffer ${(outBytes / 1e6).toFixed(0)} MB exceeds this device's ` +
+        `${(device.limits.maxStorageBufferBindingSize / 1e6).toFixed(0)} MB limit; pick a lower resolution.`, 'err');
+  }
+
+  if (srInputTensor) srInputTensor.destroy();
+  if (srOutputTensor) srOutputTensor.destroy();
+  await buildSRGraph(batch);
+  srInputTensor = await mlContext.createExportableTensor(
+    {
+      dataType: 'float16',
+      shape: [batch, 1, SR_TILE_H, SR_TILE_W],
+      writable: true,
+    }, device);
+  srOutputTensor = await mlContext.createExportableTensor(
+    {
+      dataType: 'float16',
+      shape: [batch, 1, SR_OUT_H, SR_OUT_W],
+    }, device);
+
+  const u = new Uint32Array([
+    SR_TILE_W,
+    SR_TILE_H,
+    tilesX,
+    tilesY,
+    frameW,
+    frameH,
+    frameW * SR_UPSCALE,
+    frameH * SR_UPSCALE,
+  ]);
+  device.queue.writeBuffer(uniformBuffer, 0, u);
+
+  log(`SSR resources ready: frame ${frameW}x${frameH}, ${numTiles} tiles (${tilesX}x${tilesY}) of ${SR_TILE_W}x${SR_TILE_H}, ` +
+      `batch ${batch}, output ${frameW * SR_UPSCALE}x${frameH * SR_UPSCALE}.`, 'ok');
+}
+
+// Per-frame SSR: preprocess (BGR-plane pack) -> WebNN dispatch -> GPU render.
+function processFrameSR() {
+  const metrics = { webgpuMs: 0, webnnMs: 0, transferMs: 0, ioMs: 0 };
+  const { numTiles } = srGeom;
+  const wgX = Math.ceil(SR_TILE_W / 8);
+  const wgY = Math.ceil(SR_TILE_H / 8);
+
+  const tExpIn0 = performance.now();
+  const inBuf = mlContext.exportToGPU(srInputTensor);
+  metrics.transferMs += performance.now() - tExpIn0;
+  const tImport0 = performance.now();
+  const extTex = device.importExternalTexture({ source: srcVideo });
+  metrics.ioMs += performance.now() - tImport0;
+  const tPre0 = performance.now();
+  const preBind = device.createBindGroup({
+    layout: srPreprocPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: extTex },
+      { binding: 1, resource: { buffer: inBuf } },
+      { binding: 2, resource: { buffer: uniformBuffer } },
+    ],
+  });
+  const enc = device.createCommandEncoder();
+  {
+    const pass = enc.beginComputePass();
+    pass.setPipeline(srPreprocPipeline);
+    pass.setBindGroup(0, preBind);
+    pass.dispatchWorkgroups(wgX, wgY, numTiles);
+    pass.end();
+  }
+  device.queue.submit([enc.finish()]);
+  metrics.webgpuMs += performance.now() - tPre0;
+
+  const tDestIn0 = performance.now();
+  inBuf.destroy(); // ownership -> WebNN
+  metrics.transferMs += performance.now() - tDestIn0;
+
+  const tDisp0 = performance.now();
+  mlContext.dispatch(srGraph, { input: srInputTensor }, { output: srOutputTensor });
+  metrics.webnnMs += performance.now() - tDisp0;
+
+  const tExpOut0 = performance.now();
+  const outBuf = mlContext.exportToGPU(srOutputTensor);
+  metrics.transferMs += performance.now() - tExpOut0;
+  const tRender0 = performance.now();
+  const renderBind = device.createBindGroup({
+    layout: srRenderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: outBuf } },
+      { binding: 1, resource: { buffer: uniformBuffer } },
+    ],
+  });
+  const enc2 = device.createCommandEncoder();
+  {
+    const pass = enc2.beginRenderPass({
+      colorAttachments: [{
+        view: gpuContext.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(srRenderPipeline);
+    pass.setBindGroup(0, renderBind);
+    pass.draw(3);
+    pass.end();
+  }
+  device.queue.submit([enc2.finish()]);
+  metrics.webgpuMs += performance.now() - tRender0;
+
+  const tDestOut0 = performance.now();
+  outBuf.destroy(); // ownership -> WebNN
+  metrics.transferMs += performance.now() - tDestOut0;
+  return metrics;
+}
+
+// =============================================================================
+// Source management.
+// =============================================================================
+async function startSyntheticSource() {
+  // Animated, detail-rich pattern so the enhancement is visible.
+  const { w, h } = getResolution();
+  const cvs = document.createElement('canvas');
+  cvs.width = w; cvs.height = h;
+  const ctx = cvs.getContext('2d');
+  let t = 0;
+  function draw() {
+    t += 0.016;
+    const grad = ctx.createLinearGradient(0, 0, w, h);
+    grad.addColorStop(0, `hsl(${(t * 40) % 360}, 60%, 45%)`);
+    grad.addColorStop(1, `hsl(${(t * 40 + 120) % 360}, 60%, 25%)`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 40; i++) {
+      const x = ((i * 53 + t * 60) % w);
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+    }
+    for (let i = 0; i < 6; i++) {
+      ctx.beginPath();
+      ctx.arc(w / 2 + Math.cos(t + i) * 300, h / 2 + Math.sin(t * 1.3 + i) * 180, 30 + i * 12, 0, Math.PI * 2);
+      ctx.fillStyle = `hsla(${(i * 60 + t * 90) % 360}, 80%, 60%, 0.8)`;
+      ctx.fill();
+    }
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 48px monospace';
+    ctx.fillText('WebNN SR ' + (t.toFixed(1)), 40, 80);
+    ctx.font = '16px monospace';
+    ctx.fillText('fine detail row: ||||||||||||||||||||||||||||||||||||||||', 40, 120);
+    if (mediaStream) requestAnimationFrame(draw);
+  }
+  mediaStream = cvs.captureStream(60);
+  draw();
+  srcVideo.srcObject = mediaStream;
+  await srcVideo.play();
+}
+
+async function startCameraSource() {
+  // Request the selected Input resolution as the camera capture size (the
+  // browser snaps to the nearest mode the camera actually supports).
+  const { w, h } = getResolution();
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: w }, height: { ideal: h } },
+    audio: false,
+  });
+  srcVideo.srcObject = mediaStream;
+  await srcVideo.play();
+  // Report requested vs actual so it's clear whether the camera honored the size.
+  const track = mediaStream.getVideoTracks()[0];
+  const s = track ? track.getSettings() : {};
+  const got = `${s.width || '?'}x${s.height || '?'}`;
+  const cls = (s.width === w && s.height === h) ? 'ok' : 'err';
+  log(`Camera: requested ${w}x${h}, got ${got}` +
+      `${s.frameRate ? ` @ ${Math.round(s.frameRate)}fps` : ''}` +
+      `${cls === 'err' ? ' (camera snapped to its nearest supported mode)' : ''}.`, cls);
+}
+
+async function startFileSource(file) {
+  srcVideo.srcObject = null;
+  srcVideo.src = URL.createObjectURL(file);
+  await srcVideo.play();
+}
+
+function stopSource() {
+  if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
+  srcVideo.pause();
+  srcVideo.removeAttribute('src');
+  srcVideo.srcObject = null;
+}
+
+// Interop-only micro-benchmark: hammer just the WebNN <-> WebGPU handshake
+// (exportToGPU + destroy on the input and output tensors, plus the WebNN
+// dispatch) with no video import, preprocess, render, or present. All reps
+// reuse the same tensors, so the WebNN dispatches serialize; a single dependent
+// GPU touch of the final output forces them all to complete, so
+// onSubmittedWorkDone captures the full interop round-trip.
+//
+// Splits the CPU-side cost into per-call buckets to localize the overhead:
+//   exportPerCycleMs  - the two exportToGPU calls (input + output)
+//   destroyPerCycleMs - the two GPUBuffer.destroy() ownership hand-backs
+//   dispatchPerCycleMs- the WebNN dispatch call (queueing cost, not execution)
+//   gpuWaitPerCycleMs - backend completion wait (onSubmittedWorkDone)
+async function measureInterop(reps) {
+  const elements = srGeom.batch * SR_TILE_H * SR_TILE_W;
+  const wgTotal = Math.ceil(elements / 256);
+  const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
+  const wgX = Math.min(wgTotal, maxDim);
+  const wgY = Math.ceil(wgTotal / wgX);
+  let expInMs = 0, wgpuMs = 0, destInMs = 0, dispMs = 0, expOutMs = 0, destOutMs = 0;
+  for (let i = 0; i < reps; i++) {
+    const a = performance.now();
+    const inBuf = mlContext.exportToGPU(srInputTensor);
+    const b = performance.now(); expInMs += b - a;
+
+    // WebGPU compute dispatch over the exported input buffer (while WebGPU owns it).
+    const bind = device.createBindGroup({
+      layout: interopPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: inBuf } }],
+    });
+    const enc0 = device.createCommandEncoder();
+    {
+      const pass = enc0.beginComputePass();
+      pass.setPipeline(interopPipeline);
+      pass.setBindGroup(0, bind);
+      pass.dispatchWorkgroups(wgX, wgY);
+      pass.end();
+    }
+    device.queue.submit([enc0.finish()]);
+    const w = performance.now(); wgpuMs += w - b;
+
+    inBuf.destroy(); // ownership -> WebNN
+    const c = performance.now(); destInMs += c - w;
+
+    mlContext.dispatch(srGraph, { input: srInputTensor }, { output: srOutputTensor });
+    const d = performance.now(); dispMs += d - c;
+
+    const outBuf = mlContext.exportToGPU(srOutputTensor);
+    const e = performance.now(); expOutMs += e - d;
+
+    if (i === reps - 1) {
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(outBuf, 0, scratchBuffer, 0, 4);
+      device.queue.submit([enc.finish()]);
+    }
+    const f = performance.now();
+    outBuf.destroy(); // ownership -> WebNN
+    destOutMs += performance.now() - f;
+  }
+  const tSubmit = performance.now();
+  await device.queue.onSubmittedWorkDone();
+  const gpuWaitMs = performance.now() - tSubmit;
+  return {
+    expInMs: expInMs / reps,
+    wgpuMs: wgpuMs / reps,
+    destInMs: destInMs / reps,
+    dispMs: dispMs / reps,
+    expOutMs: expOutMs / reps,
+    destOutMs: destOutMs / reps,
+    gpuWaitMs: gpuWaitMs / reps,
+  };
+}
+
+// Uncapped processing loop: paced by GPU/WebNN completion rather than by
+// requestAnimationFrame, so throughput is not clamped to the display refresh
+// rate (VSync). Awaiting onSubmittedWorkDone each frame prevents unbounded queue
+// growth while still allowing the pipeline to run as fast as the hardware can
+// finish a frame.
+async function runLoop() {
+  while (running) {
+    const pipelineMode = $('pipelineSel').value;
+    try {
+      if (pipelineMode === 'interop') {
+        await ensureSRResources();
+        const m = await measureInterop(INTEROP_REPS);
+        frames++;
+        expInSum += m.expInMs; wgpuSum += m.wgpuMs; destInSum += m.destInMs; dispSum += m.dispMs;
+        expOutSum += m.expOutMs; destOutSum += m.destOutMs; gpuWaitSum += m.gpuWaitMs;
+        const now = performance.now();
+        pushRollingSample(interopSamples, {
+          t: now,
+          expInUs: m.expInMs * 1000,
+          wgpuUs: m.wgpuMs * 1000,
+          destInUs: m.destInMs * 1000,
+          dispUs: m.dispMs * 1000,
+          expOutUs: m.expOutMs * 1000,
+          destOutUs: m.destOutMs * 1000,
+          gpuWaitUs: m.gpuWaitMs * 1000,
+        }, now);
+        if (now - lastFpsTime >= 500) {
+          // Current (bouncy) per-window averages.
+          const eIn = (expInSum / frames) * 1000;
+          const wgp = (wgpuSum / frames) * 1000;
+          const dIn = (destInSum / frames) * 1000;
+          const dsp = (dispSum / frames) * 1000;
+          const eOut = (expOutSum / frames) * 1000;
+          const dOut = (destOutSum / frames) * 1000;
+          const gpu = (gpuWaitSum / frames) * 1000;
+          const total = eIn + wgp + dIn + dsp + eOut + dOut + gpu;
+          // Rolling-window averages over recent samples.
+          let sumExpInUs = 0, sumWgpuUs = 0, sumDestInUs = 0, sumDispUs = 0;
+          let sumExpOutUs = 0, sumDestOutUs = 0, sumGpuWaitUs = 0;
+          for (const s of interopSamples) {
+            sumExpInUs += s.expInUs;
+            sumWgpuUs += s.wgpuUs;
+            sumDestInUs += s.destInUs;
+            sumDispUs += s.dispUs;
+            sumExpOutUs += s.expOutUs;
+            sumDestOutUs += s.destOutUs;
+            sumGpuWaitUs += s.gpuWaitUs;
+          }
+          const n = Math.max(1, interopSamples.length);
+          const aeIn = sumExpInUs / n;
+          const awgp = sumWgpuUs / n;
+          const adIn = sumDestInUs / n;
+          const adsp = sumDispUs / n;
+          const aeOut = sumExpOutUs / n;
+          const adOut = sumDestOutUs / n;
+          const agpu = sumGpuWaitUs / n;
+          const avgTotal = aeIn + awgp + adIn + adsp + aeOut + adOut + agpu;
+          const transferSum = aeIn + adIn + aeOut + adOut;
+          // Chips show rolling-window averages.
+          setChip('expIn', aeIn); setChip('wgpu', awgp); setChip('destIn', adIn); setChip('disp', adsp);
+          setChip('expOut', aeOut); setChip('destOut', adOut); setChip('gpuWait', agpu);
+          $('spanLabel').textContent =
+            `Iteration = ${(avgTotal / 1000).toFixed(1)} ms (avg ${ROLLING_WINDOW_MS / 1000}s) · ${(total / 1000).toFixed(1)} ms (current) (×${INTEROP_REPS})`;
+          updateTotalsInfo({ webgpuUs: awgp, webnnUs: adsp, transferUs: transferSum, ioUs: agpu });
+          frames = 0; expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
+        }
+      } else if (srcVideo.readyState >= 2 && srcVideo.videoWidth > 0) {
+        await ensureSRResources();
+        const flush = $('flushSel').value; // 'off' = rAF-paced, 'offline' = no rAF pacing
+        const t0 = performance.now();
+        const metrics = processFrameSR();
+        if (flush === 'off') {
+          // No flush: pace on the next animation frame so the pipeline can
+          // overlap frames (present happens naturally) -> throughput.
+          const tr0 = performance.now();
+          await new Promise((r) => requestAnimationFrame(() => r()));
+          metrics.ioMs += performance.now() - tr0;
+        } else {
+          // Offline: no rAF pacing and no explicit per-frame flush.
+          // Lets the loop run unpaced to measure intrinsic pipeline throughput.
+          // Periodically wait for GPU completion so the queue doesn't grow
+          // without bound and measurements remain visible/stable.
+          // Periodically yield so UI/input/log rendering can make progress.
+          offlineYieldCounter++;
+          if ((offlineYieldCounter & 7) === 0) {
+            const tw0 = performance.now();
+            await device.queue.onSubmittedWorkDone();
+            metrics.ioMs += performance.now() - tw0;
+          }
+          if ((offlineYieldCounter & 31) === 0) {
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        }
+        const dt = performance.now() - t0;
+
+        frames++;
+        const now = performance.now();
+        pushRollingSample(frameSamples, { t: now, dtMs: dt }, now);
+        if (now - lastFpsTime >= 500) {
+          // Rolling average over the recent window, plus a current 500ms reading.
+          let sumDtMs = 0;
+          for (const s of frameSamples) sumDtMs += s.dtMs;
+          const rollingFps = sumDtMs > 0 ? (frameSamples.length * 1000) / sumDtMs : 0;
+          const fps = (frames * 1000) / (now - lastFpsTime);
+          if (flush === 'off') {
+            $('spanLabel').textContent =
+              `Frame rate = ${rollingFps.toFixed(1)} fps (avg ${ROLLING_WINDOW_MS / 1000}s) · ${fps.toFixed(1)} fps (current)`;
+          } else {
+            $('spanLabel').textContent =
+              `Frame rate = ${rollingFps.toFixed(1)} fps (avg ${ROLLING_WINDOW_MS / 1000}s) · ${fps.toFixed(1)} fps (current)`;
+          }
+          frames = 0;
+          lastFpsTime = now;
+        }
+      } else {
+        // Source not ready yet; yield briefly and retry.
+        await new Promise((r) => setTimeout(r, 8));
+      }
+    } catch (e) {
+      log(`Frame error: ${e.name}: ${e.message}`, 'err');
+      stop();
+      return;
+    }
+  }
+}
+
+// =============================================================================
+// Start / stop lifecycle.
+// =============================================================================
+async function start() {
+  $('startBtn').disabled = true;
+  try {
+    console.log('[SR Benchmark] Start options', {
+      pipeline: $('pipelineSel').value,
+      webnnDevice: $('deviceSel').value,
+      webgpuAdapter: $('gpuSel').value,
+      source: $('sourceSel').value,
+      sourceResolution: $('resSel').value,
+      frameCompletion: $('flushSel').value,
+    });
+
+    await initGPU();
+    await initML($('deviceSel').value);
+
+    const pipelineMode = $('pipelineSel').value;
+    if (pipelineMode !== 'interop') {
+      const src = $('sourceSel').value;
+      if (src === 'test') await startSyntheticSource();
+      else if (src === 'camera') await startCameraSource();
+      else {
+        const f = $('fileInput').files[0];
+        if (!f) throw new Error('Choose a video file first.');
+        await startFileSource(f);
+      }
+    } else {
+      log('Interop-only mode: video source skipped; canvas will not update.', 'ok');
+    }
+
+    srGeom = null;
+    running = true;
+    $('stopBtn').disabled = false;
+    lastFpsTime = performance.now(); frames = 0;
+    expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0;
+    interopSamples = [];
+    frameSamples = [];
+    offlineYieldCounter = 0;
+    updateTotalsInfo();
+    renderPipelineDiagram();
+    log('Running.', 'ok');
+    runLoop();
+  } catch (e) {
+    log(`${e.name}: ${e.message}`, 'err');
+    $('startBtn').disabled = false;
+    running = false;
+  }
+}
+
+function stop() {
+  running = false;
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = 0;
+  stopSource();
+  $('startBtn').disabled = false;
+  $('stopBtn').disabled = true;
+  renderPipelineDiagram();
+  log('Stopped.');
+}
+
+// =============================================================================
+// Pipeline diagram (live stage chips + measured-span bracket).
+// Only the stages a mode actually runs/measures are rendered, so the bracket
+// underneath spans exactly what the current metric captures.
+// =============================================================================
+const CHIP_META = {
+  import:  'importExternalTexture',
+  expIn:   'exportToGPU',
+  wgpu:    'WebGPU compute\n(tensor touch)',
+  pre:     'WebGPU compute\n(pre-process)',
+  destIn:  'import',
+  disp:    'WebNN dispatch\n(SSR)',
+  expOut:  'exportToGPU',
+  render:  'WebGPU render\n(post-process)',
+  destOut: 'import',
+  present: 'present',
+  gpuWait: 'onSubmittedWorkDone',
+};
+const CHIP_CONV = {
+  import: 'import video texture',
+  expIn: 'export ownership',
+  wgpu: 'compute pass',
+  pre: 'tile + BGR pack',
+  destIn: 'return ownership',
+  disp: 'SSR 3x upscale',
+  expOut: 'export ownership',
+  render: 'render + stitch',
+  destOut: 'return ownership',
+  present: 'present frame',
+  gpuWait: 'await completion',
+};
+const STAGE_IO = {
+  import: { in: 'VideoFrame', inKind: 'video', out: 'GPUExternalTexture', outKind: 'texture' },
+  expIn: { in: 'MLTensor(input)', inKind: 'tensor', out: 'GPUBuffer', outKind: 'buffer' },
+  wgpu: { in: 'GPUBuffer', inKind: 'buffer', out: 'GPUBuffer', outKind: 'buffer' },
+  pre: { in: 'GPUExternalTexture', inKind: 'texture', out: 'GPUBuffer', outKind: 'buffer' },
+  destIn: { in: 'GPUBuffer', inKind: 'buffer', out: 'MLTensor(input)', outKind: 'tensor' },
+  disp: { in: 'MLTensor(input)', inKind: 'tensor', out: 'MLTensor(output)', outKind: 'tensor' },
+  expOut: { in: 'MLTensor(output)', inKind: 'tensor', out: 'GPUBuffer', outKind: 'buffer' },
+  render: { in: 'GPUBuffer', inKind: 'buffer', out: 'Canvas', outKind: 'canvas' },
+  destOut: { in: 'GPUBuffer', inKind: 'buffer', out: 'MLTensor(output)', outKind: 'tensor' },
+  present: { in: 'Canvas', inKind: 'canvas', out: 'Display', outKind: 'display' },
+  gpuWait: { in: 'Queue work', inKind: 'sync', out: 'Completed', outKind: 'sync' },
+};
+const PIPELINE_STAGES = {
+  interop: ['expIn', 'wgpu', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
+  full: ['import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
+};
+const STAGE_DOMAIN = {
+  present: 'io',
+  gpuWait: 'io',
+  import: 'io',
+  expIn: 'transfer',
+  destIn: 'transfer',
+  expOut: 'transfer',
+  destOut: 'transfer',
+  wgpu: 'webgpu',
+  pre: 'webgpu',
+  render: 'webgpu',
+  disp: 'webnn',
+};
+function setChip(key, us) {
+  const el = document.getElementById('val-' + key);
+  if (el) el.textContent = `${us.toFixed(0)} µs`;
+}
+function updateTotalsInfo(avgUs) {
+  const isInterop = $('pipelineSel').value === 'interop';
+  const fmt = (v) => `${(v / 1000).toFixed(3)} ms`;
+  $('legendWebgpu').textContent = isInterop
+    ? `WebGPU compute/render${avgUs ? ` (total ${fmt(avgUs.webgpuUs)})` : ''}`
+    : 'WebGPU compute/render';
+  $('legendWebnn').textContent = isInterop
+    ? `WebNN dispatch${avgUs ? ` (total ${fmt(avgUs.webnnUs)})` : ''}`
+    : 'WebNN dispatch';
+  $('legendTransfer').textContent = isInterop
+    ? `Tensor transfer${avgUs ? ` (total ${fmt(avgUs.transferUs)})` : ''}`
+    : 'Tensor transfer';
+  $('legendIo').textContent = isInterop
+    ? `Video/Present/Wait${avgUs ? ` (total ${fmt(avgUs.ioUs)})` : ''}`
+    : 'Video/Present/Wait';
+}
+function getResolution() {
+  const [w, h] = $('resSel').value.split('x').map(Number);
+  return { w, h };
+}
+function toPLabel(w, h) {
+  return `${h}p`;
+}
+function formatResolution(w, h) {
+  return `${w}x${h}`;
+}
+function getActiveSourceResolution() {
+  const src = $('sourceSel').value;
+  if (src === 'test') {
+    return getResolution();
+  }
+  if (srcVideo.videoWidth > 0 && srcVideo.videoHeight > 0) {
+    return { w: srcVideo.videoWidth, h: srcVideo.videoHeight };
+  }
+  return null;
+}
+function updateResolutionInfo() {
+  const pipelineMode = $('pipelineSel').value;
+  const src = $('sourceSel').value;
+  const srcRes = getActiveSourceResolution();
+  const srcText = srcRes ? formatResolution(srcRes.w, srcRes.h)
+    : (src === 'test' ? 'unknown' : 'native (pending)');
+
+  let targetText = srcText;
+  if (pipelineMode === 'interop') {
+    targetText = 'n/a (no present)';
+  } else {
+    targetText = srcRes
+      ? toPLabel(srcRes.w * SR_UPSCALE, srcRes.h * SR_UPSCALE)
+      : `${SR_UPSCALE}x source (pending)`;
+  }
+
+  const targetEl = $('targetInfo');
+  if (targetEl) targetEl.textContent = `\u2192 ${targetText}`;
+  const sourceEl = $('sourceInfo');
+  if (sourceEl) sourceEl.textContent = `\u2192 ${srcText}`;
+  renderTileViz();
+}
+function getActiveTile() {
+  return { w: SR_TILE_W, h: SR_TILE_H };
+}
+// Draw a clean, aspect-correct schematic of the source frame split into tiles of
+// the active format, including the clamp-padded edge region beyond the frame.
+function renderTileViz() {
+  const svg = $('tileSvg');
+  if (!svg) return;
+  const res = getActiveSourceResolution() || getResolution();
+  const frameW = res.w, frameH = res.h;
+  const { w: tw, h: th } = getActiveTile();
+  const tilesX = Math.ceil(frameW / tw);
+  const tilesY = Math.ceil(frameH / th);
+  const numTiles = tilesX * tilesY;
+  const gridW = tilesX * tw, gridH = tilesY * th; // padded extent (>= frame)
+
+  const MAXW = 300, MAXH = 190;
+  const scale = Math.min(MAXW / gridW, MAXH / gridH);
+  const W = Math.max(1, Math.round(gridW * scale));
+  const H = Math.max(1, Math.round(gridH * scale));
+  const fw = Math.round(frameW * scale), fh = Math.round(frameH * scale);
+  svg.setAttribute('width', W);
+  svg.setAttribute('height', H);
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+  const p = [];
+  // Padded grid area (amber tint marks clamp-padding beyond the frame).
+  p.push(`<rect x="0" y="0" width="${W}" height="${H}" fill="rgba(242,173,79,0.10)"/>`);
+  // Actual frame content area.
+  p.push(`<rect x="0" y="0" width="${fw}" height="${fh}" fill="#1c1f24"/>`);
+  // Tile grid lines.
+  for (let i = 1; i < tilesX; i++) {
+    const x = Math.round(i * tw * scale);
+    p.push(`<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="#4c8df6" stroke-width="1" opacity="0.55"/>`);
+  }
+  for (let j = 1; j < tilesY; j++) {
+    const y = Math.round(j * th * scale);
+    p.push(`<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="#4c8df6" stroke-width="1" opacity="0.55"/>`);
+  }
+  // Frame outline + outer grid outline.
+  p.push(`<rect x="0.75" y="0.75" width="${fw - 1.5}" height="${fh - 1.5}" fill="none" stroke="#5c9ded" stroke-width="1.5"/>`);
+  p.push(`<rect x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" fill="none" stroke="#33373d"/>`);
+  svg.innerHTML = p.join('');
+
+  $('tileCaption').textContent = `${frameW}\u00d7${frameH}`;
+}
+function renderPipelineDiagram() {
+  const pipelineMode = $('pipelineSel').value;
+  const isInterop = pipelineMode === 'interop';
+  const stages = [...PIPELINE_STAGES[pipelineMode]];
+  const chips = $('chips');
+  chips.innerHTML = '';
+  stages.forEach((key, i) => {
+    const chip = document.createElement('div');
+    chip.className = `chip domain-${STAGE_DOMAIN[key] || 'io'}`;
+    const io = STAGE_IO[key] || {};
+    const inBox = io.in ? `<div class="io-item"><span class="io-label">IN</span><span class="io-box io-kind-${io.inKind || 'sync'}">${io.in}</span></div>` : '';
+    const outBox = io.out ? `<div class="io-item"><span class="io-label">OUT</span><span class="io-box io-kind-${io.outKind || 'sync'}">${io.out}</span></div>` : '';
+    chip.innerHTML = `<div class="name">${CHIP_META[key]}</div><div class="conv">${CHIP_CONV[key] || ''}</div><div class="io-row">${inBox}${outBox}</div><div class="val" id="val-${key}"></div>`;
+    chips.appendChild(chip);
+    if (i < stages.length - 1) {
+      const ar = document.createElement('span');
+      ar.className = 'arrow';
+      ar.textContent = '\u2192';
+      chips.appendChild(ar);
+    }
+  });
+  $('pipelineTitle').textContent = 'Pipeline';
+  // Only show the span label while running; keep it blank when idle.
+  const spanPrefix = isInterop
+    ? 'Iteration'
+    : 'Frame rate';
+  $('spanLabel').textContent = running ? spanPrefix : '';
+  updateTotalsInfo();
+}
+
+// =============================================================================
+// UI wiring.
+// =============================================================================
+function updateSourceUI() {
+  const src = $('sourceSel').value;
+  const isInterop = $('pipelineSel').value === 'interop';
+  $('fileInput').style.display = src === 'file' ? '' : 'none';
+  // Resolution drives the test pattern and the requested camera capture size; a
+  // local file uses its own native size. Interop ignores the source and sizes
+  // its tensors by this resolution, so keep it enabled there too.
+  $('resSel').disabled = !isInterop && src === 'file';
+  // The Source preview is only informative for real inputs (camera / file); the
+  // test pattern is self-generated, so hide its (redundant) preview.
+  $('sourceFigure').style.display = src === 'test' ? 'none' : '';
+  updateResolutionInfo();
+}
+function updateDispatchUI() {
+  const isInterop = $('pipelineSel').value === 'interop';
+  $('flushSel').disabled = isInterop;
+  $('stage').style.display = isInterop ? 'none' : '';
+  // Interop sizes its tensors by the Input resolution (ignoring the source), and
+  // camera/test use it too; only a local file has a fixed native size.
+  $('resSel').disabled = !isInterop && $('sourceSel').value === 'file';
+  updateResolutionInfo();
+}
+$('sourceSel').addEventListener('change', updateSourceUI);
+$('pipelineSel').addEventListener('change', () => { updateDispatchUI(); renderPipelineDiagram(); });
+$('flushSel').addEventListener('change', () => { renderPipelineDiagram(); });
+$('resSel').addEventListener('change', () => { srGeom = null; updateResolutionInfo(); });
+srcVideo.addEventListener('loadedmetadata', updateResolutionInfo);
+srcVideo.addEventListener('resize', updateResolutionInfo);
+$('startBtn').addEventListener('click', start);
+$('stopBtn').addEventListener('click', stop);
+
+// -----------------------------------------------------------------------------
+// Shareable config via URL query params: every control is encoded so a link
+// reproduces an exact workload. `?autostart=1` also begins the run on load, so
+// you can send a customer a URL that runs their specified configuration.
+// -----------------------------------------------------------------------------
+const URL_PARAMS = {
+  device:     'deviceSel',
+  adapter:    'gpuSel',
+  pipeline:   'pipelineSel',
+  completion: 'flushSel',
+  input:      'resSel',
+  source:     'sourceSel',
+};
+const URL_PARAM_ALIASES = {
+  input: ['inputres', 'res'],
+};
+const P_LABEL_TO_VALUE = {
+  '240p': '426x240',
+  '360p': '640x360',
+  '480p': '854x480',
+  '720p': '1280x720',
+  '1080p': '1920x1080',
+  '1440p': '2560x1440',
+  '2160p': '3840x2160',
+};
+function resolutionValueToLabel(value) {
+  const [w, h] = String(value).split('x').map(Number);
+  if (!Number.isFinite(h)) return String(value);
+  return `${h}p`;
+}
+function resolutionLabelToValue(label) {
+  return P_LABEL_TO_VALUE[String(label).toLowerCase()] || label;
+}
+function getURLParamValue(q, key) {
+  const names = [key, ...(URL_PARAM_ALIASES[key] || [])];
+  for (const name of names) {
+    const value = q.get(name);
+    if (value != null) return value;
+  }
+  return null;
+}
+function applyConfigFromURL() {
+  const q = new URLSearchParams(location.search);
+  for (const [key, id] of Object.entries(URL_PARAMS)) {
+    const val = getURLParamValue(q, key);
+    if (val == null) continue;
+    const el = $(id);
+    const normalized = id === 'resSel' ? resolutionLabelToValue(val) : val;
+    if (el && [...el.options].some((o) => o.value === normalized)) {
+      el.value = normalized;
+    }
+  }
+}
+function syncURLFromConfig() {
+  const q = new URLSearchParams();
+  for (const [key, id] of Object.entries(URL_PARAMS)) {
+    const value = $(id).value;
+    q.set(key, id === 'resSel' ? resolutionValueToLabel(value) : value);
+  }
+  const auto = new URLSearchParams(location.search).get('autostart');
+  if (auto != null) q.set('autostart', auto);
+  history.replaceState(null, '', `${location.pathname}?${q.toString()}`);
+}
+for (const id of Object.values(URL_PARAMS)) {
+  $(id).addEventListener('change', syncURLFromConfig);
+}
+$('copyLinkBtn').addEventListener('click', async () => {
+  syncURLFromConfig();
+  try {
+    await navigator.clipboard.writeText(location.href);
+    log('Config URL copied to clipboard.', 'ok');
+  } catch {
+    log('Copy failed; copy the address-bar URL manually.', 'err');
+  }
+});
+
+const wantAutostart = /^(1|true|yes)$/i.test(
+  new URLSearchParams(location.search).get('autostart') || '');
+applyConfigFromURL();
+updateSourceUI();
+updateDispatchUI();
+renderPipelineDiagram();
+syncURLFromConfig();
+
+// Report whether WebGPU and WebNN are actually enabled at runtime (not just
+// present) so a customer immediately sees if the required flags are missing.
+function disableStart(reason) {
+  $('startBtn').disabled = true;
+  $('startBtn').title = reason;
+}
+async function reportStatus() {
+  const gpuOk = !!navigator.gpu;
+  log(`WebGPU: ${gpuOk ? 'available' : 'NOT available (navigator.gpu missing)'}`,
+      gpuOk ? 'ok' : 'err');
+
+  if (!navigator.ml) {
+    log('WebNN: NOT enabled \u2014 navigator.ml missing. Launch Chromium with ' +
+        '--enable-features=WebMachineLearningNeuralNetwork', 'err');
+    disableStart('WebNN is not enabled. Launch Chromium with ' +
+        '--enable-features=WebMachineLearningNeuralNetwork');
+    return;
+  }
+  try {
+    // createContext only succeeds when WebNN is genuinely enabled/usable.
+    await navigator.ml.createContext();
+    log('WebNN: available', 'ok');
+  } catch (e) {
+    log(`WebNN: present but not usable \u2014 ${e.name}: ${e.message}`, 'err');
+    disableStart(`WebNN context creation failed: ${e.name}: ${e.message}`);
+    return;
+  }
+
+  // Probe exportable-tensor interop: create an MLContext bound to a WebGPU
+  // device, allocate an exportable tensor, and export it to a GPUBuffer. This is
+  // the actual capability the benchmark depends on, so gate Start on it.
+  if (!gpuOk) {
+    log('WebNN interop: cannot probe (WebGPU unavailable).', 'err');
+    disableStart('WebGPU is unavailable, so WebNN <-> WebGPU interop cannot run.');
+    return;
+  }
+  try {
+    const probeAdapter = await navigator.gpu.requestAdapter();
+    if (!probeAdapter) throw new Error('no WebGPU adapter');
+    const probeDevice = await probeAdapter.requestDevice();
+    const selectedDevice = $('deviceSel').value;
+    const probeCtx = await navigator.ml.createContext({ deviceType: selectedDevice });
+    const probe = await probeCtx.createExportableTensor(
+      { dataType: 'float16', shape: [2] }, probeDevice);
+    probeCtx.exportToGPU(probe);
+    probe.destroy();
+    probeDevice.destroy();
+    log('WebNN interop: supported.', 'ok');
+    $('startBtn').disabled = false;
+    $('startBtn').title = '';
+  } catch (e) {
+    log('WebNN interop: not supported.', 'err');
+    disableStart(`WebNN <-> WebGPU exportable-tensor interop unavailable: ${e.name}: ${e.message}`);
+  }
+}
+
+log('Ready. Requires a Chromium build with WebNN + WebGPU exportable-tensor interop enabled.');
+reportStatus();
+
+if (wantAutostart) {
+  if ($('pipelineSel').value !== 'interop' && $('sourceSel').value === 'file') {
+    log('autostart skipped: the local-file source needs a manual file selection.', 'err');
+  } else {
+    start();
+  }
+}
+</script>
+</body>
+</html>
