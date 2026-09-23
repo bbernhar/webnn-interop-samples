@@ -256,7 +256,7 @@ function pushRollingSample(bucket, sample, now) {
   while (bucket.length && bucket[0].t < cutoff) bucket.shift();
 }
 
-const CHANNELS = 3;
+const CHANNELS = 1;
 
 // -----------------------------------------------------------------------------
 // Global state.
@@ -275,6 +275,7 @@ const SR_UPSCALE = 3;
 const SR_OUT_H = SR_TILE_H * SR_UPSCALE;
 const SR_OUT_W = SR_TILE_W * SR_UPSCALE;
 let uniformBuffer = null;
+let tileUniformBuffers = [];
 let scratchBuffer = null;
 
 // Repetitions per sample in interop-only mode (amortizes call + timer noise).
@@ -302,14 +303,15 @@ let offlineYieldCounter = 0;
 // =============================================================================
 const UNIFORM_WGSL = `
 struct Params {
-  tileW  : u32,
-  tileH  : u32,
-  tilesX : u32,
-  tilesY : u32,
-  frameW : u32,
-  frameH : u32,
-  outW   : u32,
-  outH   : u32,
+  tileW   : u32,
+  tileH   : u32,
+  tilesX  : u32,
+  tilesY  : u32,
+  frameW  : u32,
+  frameH  : u32,
+  outW    : u32,
+  outH    : u32,
+  tileIdx : u32,
 };
 `;
 
@@ -333,7 +335,7 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
 }
 `;
 
-// SSR preprocess: sample each 240x360 tile into the exported FP16 tensor.
+// SSR preprocess: sample 240x360 tile Luma (Y) into the exported FP16 tensor.
 const SR_PREPROCESS_WGSL = `
 enable f16;
 ` + UNIFORM_WGSL + `
@@ -345,62 +347,91 @@ enable f16;
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let gx = gid.x;
   let gy = gid.y;
-  let tile = gid.z;
-  if (gx >= p.tileW || gy >= p.tileH || tile >= p.tilesX * p.tilesY) { return; }
+  if (gx >= p.tileW || gy >= p.tileH) { return; }
 
-  let tileX = tile % p.tilesX;
-  let tileY = tile / p.tilesX;
+  let tileX = p.tileIdx % p.tilesX;
+  let tileY = p.tileIdx / p.tilesX;
   let srcY = min(tileY * p.tileH + gy, p.frameH - 1u);
   let srcX = min(tileX * p.tileW + gx, p.frameW - 1u);
-  let rgb = textureLoad(extTex, vec2<i32>(i32(srcX), i32(srcY))).rgb;
+  let rgb = textureLoad(extTex, vec2<u32>(srcX, srcY)).rgb;
 
-  let plane = p.tileW * p.tileH;
-  let pixel = gy * p.tileW + gx;
-  // Batch layout: element (tile*3 + channel), channel order B, G, R.
-  ioBuf[(tile * 3u + 0u) * plane + pixel] = f16(rgb.b);
-  ioBuf[(tile * 3u + 1u) * plane + pixel] = f16(rgb.g);
-  ioBuf[(tile * 3u + 2u) * plane + pixel] = f16(rgb.r);
+  // Extract Luma Y (BT.601 / standard sRGB luma)
+  let y = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+  ioBuf[gy * p.tileW + gx] = f16(y);
 }
 `;
 
-// SSR postprocess: read the FP16 output, recombine BGR planes, and render
-// rectangular 720x1080 tiles directly to the 3x canvas.
+// SSR postprocess: read the FP16 Luma SR output, fuse with original Chroma (Cb, Cr),
+// and render the upscaled tile quad to the canvas.
 const SR_RENDER_WGSL = `
 enable f16;
 ` + UNIFORM_WGSL + `
 @group(0) @binding(0) var<storage, read> ioBuf : array<f16>;
-@group(0) @binding(1) var<uniform> p : Params;
+@group(0) @binding(1) var extTex : texture_external;
+@group(0) @binding(2) var<uniform> p : Params;
+
+struct VertexOutput {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+  @location(1) globalPx : vec2<f32>,
+};
 
 @vertex
-fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
-  var pos = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -1.0),
-    vec2<f32>( 3.0, -1.0),
-    vec2<f32>(-1.0,  3.0));
-  return vec4<f32>(pos[vi], 0.0, 1.0);
+fn vs(@builtin(vertex_index) vi : u32) -> VertexOutput {
+  let tileX = f32(p.tileIdx % p.tilesX);
+  let tileY = f32(p.tileIdx / p.tilesX);
+  let outTileW = f32(p.tileW * 3u);
+  let outTileH = f32(p.tileH * 3u);
+  let outW = f32(p.outW);
+  let outH = f32(p.outH);
+
+  var uvs = array<vec2<f32>, 6>(
+    vec2<f32>(0.0, 0.0),
+    vec2<f32>(1.0, 0.0),
+    vec2<f32>(0.0, 1.0),
+    vec2<f32>(0.0, 1.0),
+    vec2<f32>(1.0, 0.0),
+    vec2<f32>(1.0, 1.0)
+  );
+  let uv = uvs[vi];
+  let px = tileX * outTileW + uv.x * outTileW;
+  let py = tileY * outTileH + uv.y * outTileH;
+
+  let ndcX = (px / outW) * 2.0 - 1.0;
+  let ndcY = 1.0 - (py / outH) * 2.0;
+
+  var out : VertexOutput;
+  out.pos = vec4<f32>(ndcX, ndcY, 0.0, 1.0);
+  out.uv = uv;
+  out.globalPx = vec2<f32>(px, py);
+  return out;
 }
 
 @fragment
-fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
+fn fs(in : VertexOutput) -> @location(0) vec4<f32> {
+  if (in.globalPx.x >= f32(p.outW) || in.globalPx.y >= f32(p.outH)) {
+    discard;
+  }
   let outTileW = p.tileW * 3u;
   let outTileH = p.tileH * 3u;
-  let outW = p.frameW * 3u;
-  let outH = p.frameH * 3u;
-  let px = u32(fragCoord.x);
-  let py = u32(fragCoord.y);
-  if (px >= outW || py >= outH) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  let ox = min(u32(in.uv.x * f32(outTileW)), outTileW - 1u);
+  let oy = min(u32(in.uv.y * f32(outTileH)), outTileH - 1u);
 
-  let tileX = px / outTileW;
-  let tileY = py / outTileH;
-  let ox = px % outTileW;
-  let oy = py % outTileH;
-  let tile = tileY * p.tilesX + tileX;
+  let ySr = f32(ioBuf[oy * outTileW + ox]);
 
-  let oplane = outTileW * outTileH;
-  let opix = oy * outTileW + ox;
-  let b = f32(ioBuf[(tile * 3u + 0u) * oplane + opix]);
-  let g = f32(ioBuf[(tile * 3u + 1u) * oplane + opix]);
-  let r = f32(ioBuf[(tile * 3u + 2u) * oplane + opix]);
+  let srcCoord = vec2<u32>(
+    min(u32(in.globalPx.x / 3.0), p.frameW - 1u),
+    min(u32(in.globalPx.y / 3.0), p.frameH - 1u)
+  );
+  let origRgb = textureLoad(extTex, srcCoord).rgb;
+
+  let cb = -0.168736 * origRgb.r - 0.331264 * origRgb.g + 0.5 * origRgb.b;
+  let cr = 0.5 * origRgb.r - 0.418688 * origRgb.g - 0.081312 * origRgb.b;
+
+  let r = ySr + 1.402 * cr;
+  let g = ySr - 0.344136 * cb - 0.714136 * cr;
+  let b = ySr + 1.772 * cb;
+
   return vec4<f32>(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0), 1.0);
 }
 `;
@@ -540,12 +571,12 @@ function randomFp16Constant(builder, random, shape, scale, bias = 0) {
 }
 
 // Rebuild the analyzed TFLite topology with deterministic random FP16 weights.
-async function buildSRGraph(batch) {
+async function buildSRGraph() {
   const b = new MLGraphBuilder(mlContext);
   const random = createRandom(0x53535231);
   const input = b.input('input', {
     dataType: 'float16',
-    shape: [batch, 1, SR_TILE_H, SR_TILE_W],
+    shape: [1, 1, SR_TILE_H, SR_TILE_W],
   });
   const conv = (value, outputChannels, inputChannels, options = {}) => {
     const weights = randomFp16Constant(
@@ -559,10 +590,10 @@ async function buildSRGraph(batch) {
   };
   const pixelShuffle = (value, channels, height, width) => {
     let output = b.reshape(
-        value, [batch, SR_UPSCALE, SR_UPSCALE, channels, height, width]);
+        value, [1, SR_UPSCALE, SR_UPSCALE, channels, height, width]);
     output = b.transpose(output, { permutation: [0, 3, 4, 1, 5, 2] });
     return b.reshape(
-        output, [batch, channels, height * SR_UPSCALE, width * SR_UPSCALE]);
+        output, [1, channels, height * SR_UPSCALE, width * SR_UPSCALE]);
   };
 
   const baseline = b.resample2d(input, {
@@ -597,123 +628,138 @@ async function ensureSRResources() {
   const tilesX = Math.ceil(frameW / SR_TILE_W);
   const tilesY = Math.ceil(frameH / SR_TILE_H);
   const numTiles = tilesX * tilesY;
-  const batch = numTiles * CHANNELS; // one 1-channel batch element per B/G/R plane
+  const batch = 1;
   srGeom = { frameW, frameH, tilesX, tilesY, numTiles, batch };
 
   outCanvas.width = frameW * SR_UPSCALE;
   outCanvas.height = frameH * SR_UPSCALE;
 
-  // Warn if the (large) output tensor would exceed the storage-buffer binding limit.
-  const outBytes = batch * SR_OUT_H * SR_OUT_W * 2;
-  if (outBytes > device.limits.maxStorageBufferBindingSize) {
-    log(`SR output buffer ${(outBytes / 1e6).toFixed(0)} MB exceeds this device's ` +
-        `${(device.limits.maxStorageBufferBindingSize / 1e6).toFixed(0)} MB limit; pick a lower resolution.`, 'err');
+  if (!srGraph) {
+    await buildSRGraph();
+  }
+  if (!srInputTensor) {
+    srInputTensor = await mlContext.createExportableTensor(
+      {
+        dataType: 'float16',
+        shape: [1, 1, SR_TILE_H, SR_TILE_W],
+        writable: true,
+      }, device);
+  }
+  if (!srOutputTensor) {
+    srOutputTensor = await mlContext.createExportableTensor(
+      {
+        dataType: 'float16',
+        shape: [1, 1, SR_OUT_H, SR_OUT_W],
+      }, device);
   }
 
-  if (srInputTensor) srInputTensor.destroy();
-  if (srOutputTensor) srOutputTensor.destroy();
-  await buildSRGraph(batch);
-  srInputTensor = await mlContext.createExportableTensor(
-    {
-      dataType: 'float16',
-      shape: [batch, 1, SR_TILE_H, SR_TILE_W],
-      writable: true,
-    }, device);
-  srOutputTensor = await mlContext.createExportableTensor(
-    {
-      dataType: 'float16',
-      shape: [batch, 1, SR_OUT_H, SR_OUT_W],
-    }, device);
-
-  const u = new Uint32Array([
-    SR_TILE_W,
-    SR_TILE_H,
-    tilesX,
-    tilesY,
-    frameW,
-    frameH,
-    frameW * SR_UPSCALE,
-    frameH * SR_UPSCALE,
-  ]);
-  device.queue.writeBuffer(uniformBuffer, 0, u);
+  // Create or update uniform buffers for each tile
+  tileUniformBuffers = [];
+  for (let i = 0; i < numTiles; i++) {
+    const ub = device.createBuffer({
+      size: 48,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const u = new Uint32Array([
+      SR_TILE_W,
+      SR_TILE_H,
+      tilesX,
+      tilesY,
+      frameW,
+      frameH,
+      frameW * SR_UPSCALE,
+      frameH * SR_UPSCALE,
+      i,
+    ]);
+    device.queue.writeBuffer(ub, 0, u);
+    tileUniformBuffers.push(ub);
+  }
 
   log(`SSR resources ready: frame ${frameW}x${frameH}, ${numTiles} tiles (${tilesX}x${tilesY}) of ${SR_TILE_W}x${SR_TILE_H}, ` +
-      `batch ${batch}, output ${frameW * SR_UPSCALE}x${frameH * SR_UPSCALE}.`, 'ok');
+      `batch 1 (Luma SR), output ${frameW * SR_UPSCALE}x${frameH * SR_UPSCALE}.`, 'ok');
 }
 
-// Per-frame SSR: preprocess (BGR-plane pack) -> WebNN dispatch -> GPU render.
+// Per-frame SSR: preprocess (Luma extraction) -> WebNN dispatch -> GPU render (Luma + Chroma fusion) per tile.
 function processFrameSR() {
   const metrics = { webgpuMs: 0, webnnMs: 0, transferMs: 0, ioMs: 0 };
   const { numTiles } = srGeom;
   const wgX = Math.ceil(SR_TILE_W / 8);
   const wgY = Math.ceil(SR_TILE_H / 8);
 
-  const tExpIn0 = performance.now();
-  const inBuf = mlContext.exportToGPU(srInputTensor);
-  metrics.transferMs += performance.now() - tExpIn0;
   const tImport0 = performance.now();
   const extTex = device.importExternalTexture({ source: srcVideo });
   metrics.ioMs += performance.now() - tImport0;
-  const tPre0 = performance.now();
-  const preBind = device.createBindGroup({
-    layout: srPreprocPipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: extTex },
-      { binding: 1, resource: { buffer: inBuf } },
-      { binding: 2, resource: { buffer: uniformBuffer } },
-    ],
-  });
-  const enc = device.createCommandEncoder();
-  {
-    const pass = enc.beginComputePass();
-    pass.setPipeline(srPreprocPipeline);
-    pass.setBindGroup(0, preBind);
-    pass.dispatchWorkgroups(wgX, wgY, numTiles);
-    pass.end();
-  }
-  device.queue.submit([enc.finish()]);
-  metrics.webgpuMs += performance.now() - tPre0;
 
-  const tDestIn0 = performance.now();
-  inBuf.destroy(); // ownership -> WebNN
-  metrics.transferMs += performance.now() - tDestIn0;
+  for (let tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
+    const tileUb = tileUniformBuffers[tileIdx];
 
-  const tDisp0 = performance.now();
-  mlContext.dispatch(srGraph, { input: srInputTensor }, { output: srOutputTensor });
-  metrics.webnnMs += performance.now() - tDisp0;
+    const tExpIn0 = performance.now();
+    const inBuf = mlContext.exportToGPU(srInputTensor);
+    metrics.transferMs += performance.now() - tExpIn0;
 
-  const tExpOut0 = performance.now();
-  const outBuf = mlContext.exportToGPU(srOutputTensor);
-  metrics.transferMs += performance.now() - tExpOut0;
-  const tRender0 = performance.now();
-  const renderBind = device.createBindGroup({
-    layout: srRenderPipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: outBuf } },
-      { binding: 1, resource: { buffer: uniformBuffer } },
-    ],
-  });
-  const enc2 = device.createCommandEncoder();
-  {
-    const pass = enc2.beginRenderPass({
-      colorAttachments: [{
-        view: gpuContext.getCurrentTexture().createView(),
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        loadOp: 'clear',
-        storeOp: 'store',
-      }],
+    const tPre0 = performance.now();
+    const preBind = device.createBindGroup({
+      layout: srPreprocPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: extTex },
+        { binding: 1, resource: { buffer: inBuf } },
+        { binding: 2, resource: { buffer: tileUb } },
+      ],
     });
-    pass.setPipeline(srRenderPipeline);
-    pass.setBindGroup(0, renderBind);
-    pass.draw(3);
-    pass.end();
-  }
-  device.queue.submit([enc2.finish()]);
-  metrics.webgpuMs += performance.now() - tRender0;
+    const enc = device.createCommandEncoder();
+    {
+      const pass = enc.beginComputePass();
+      pass.setPipeline(srPreprocPipeline);
+      pass.setBindGroup(0, preBind);
+      pass.dispatchWorkgroups(wgX, wgY, 1);
+      pass.end();
+    }
+    device.queue.submit([enc.finish()]);
+    metrics.webgpuMs += performance.now() - tPre0;
 
-  const tDestOut0 = performance.now();
-  outBuf.destroy(); // ownership -> WebNN
-  metrics.transferMs += performance.now() - tDestOut0;
+    const tDestIn0 = performance.now();
+    inBuf.destroy(); // ownership -> WebNN
+    metrics.transferMs += performance.now() - tDestIn0;
+
+    const tDisp0 = performance.now();
+    mlContext.dispatch(srGraph, { input: srInputTensor }, { output: srOutputTensor });
+    metrics.webnnMs += performance.now() - tDisp0;
+
+    const tExpOut0 = performance.now();
+    const outBuf = mlContext.exportToGPU(srOutputTensor);
+    metrics.transferMs += performance.now() - tExpOut0;
+
+    const tRender0 = performance.now();
+    const renderBind = device.createBindGroup({
+      layout: srRenderPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: outBuf } },
+        { binding: 1, resource: extTex },
+        { binding: 2, resource: { buffer: tileUb } },
+      ],
+    });
+    const enc2 = device.createCommandEncoder();
+    {
+      const pass = enc2.beginRenderPass({
+        colorAttachments: [{
+          view: gpuContext.getCurrentTexture().createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: tileIdx === 0 ? 'clear' : 'load',
+          storeOp: 'store',
+        }],
+      });
+      pass.setPipeline(srRenderPipeline);
+      pass.setBindGroup(0, renderBind);
+      pass.draw(6);
+      pass.end();
+    }
+    device.queue.submit([enc2.finish()]);
+    metrics.webgpuMs += performance.now() - tRender0;
+
+    const tDestOut0 = performance.now();
+    outBuf.destroy(); // ownership -> WebNN
+    metrics.transferMs += performance.now() - tDestOut0;
+  }
   return metrics;
 }
 
@@ -805,7 +851,7 @@ function stopSource() {
 //   dispatchPerCycleMs- the WebNN dispatch call (queueing cost, not execution)
 //   gpuWaitPerCycleMs - backend completion wait (onSubmittedWorkDone)
 async function measureInterop(reps) {
-  const elements = srGeom.batch * SR_TILE_H * SR_TILE_W;
+  const elements = SR_TILE_H * SR_TILE_W;
   const wgTotal = Math.ceil(elements / 256);
   const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
   const wgX = Math.min(wgTotal, maxDim);
@@ -1061,11 +1107,11 @@ const CHIP_META = {
   import:  'importExternalTexture',
   expIn:   'exportToGPU',
   wgpu:    'WebGPU compute\n(tensor touch)',
-  pre:     'WebGPU compute\n(pre-process)',
+  pre:     'WebGPU compute\n(Luma extract)',
   destIn:  'import',
-  disp:    'WebNN dispatch\n(SSR)',
+  disp:    'WebNN dispatch\n(Luma SSR)',
   expOut:  'exportToGPU',
-  render:  'WebGPU render\n(post-process)',
+  render:  'WebGPU render\n(Luma+Chroma fusion)',
   destOut: 'import',
   present: 'present',
   gpuWait: 'onSubmittedWorkDone',
@@ -1074,11 +1120,11 @@ const CHIP_CONV = {
   import: 'import video texture',
   expIn: 'export ownership',
   wgpu: 'compute pass',
-  pre: 'tile + BGR pack',
+  pre: 'tile + Y extract',
   destIn: 'return ownership',
-  disp: 'SSR 3x upscale',
+  disp: 'Luma 3x upscale',
   expOut: 'export ownership',
-  render: 'render + stitch',
+  render: 'render + chroma fuse',
   destOut: 'return ownership',
   present: 'present frame',
   gpuWait: 'await completion',
