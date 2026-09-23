@@ -910,7 +910,8 @@ async function measureInterop(reps) {
   const wgX = Math.min(wgTotal, maxDim);
   const wgY = Math.ceil(wgTotal / wgX);
   const dispatchMode = $('dispatchSel').value;
-  const currentGraph = passGraph;
+  const isSR = dispatchMode === 'sr';
+  const currentGraph = isSR ? srGraph : passGraph;
   let expInMs = 0, wgpuMs = 0, destInMs = 0, dispMs = 0, expOutMs = 0, destOutMs = 0;
   for (let i = 0; i < reps; i++) {
     const a = performance.now();
@@ -1026,7 +1027,8 @@ async function runLoop() {
           const avgTotal = aeIn + awgp + adIn + adsp + aeOut + adOut + agpu;
           const transferSum = aeIn + adIn + aeOut + adOut;
           // Chips show rolling-window averages.
-          setChip('expIn', aeIn); setChip('wgpu', awgp); setChip('destIn', adIn); setChip('disp', adsp);
+          setChip('expIn', aeIn); setChip('wgpu', awgp); setChip('destIn', adIn);
+          setChip('disp', adsp); setChip('dispSR', adsp);
           setChip('expOut', aeOut); setChip('destOut', adOut); setChip('gpuWait', agpu);
           $('spanLabel').textContent =
             `Iteration = ${(avgTotal / 1000).toFixed(1)} ms (avg ${ROLLING_WINDOW_MS / 1000}s) · ${(total / 1000).toFixed(1)} ms (current) (×${INTEROP_REPS})`;
@@ -1164,7 +1166,7 @@ function stop() {
 const CHIP_META = {
   import:  'importExternalTexture',
   expIn:   'exportToGPU',
-  wgpu:    'WebGPU compute\n(tensor touch)',
+  wgpu:    'WebGPU compute\n(pass-through)',
   pre:     'WebGPU compute\n(Luma extract)',
   destIn:  'import',
   disp:    'WebNN dispatch\n(pass-through)',
@@ -1205,6 +1207,7 @@ const STAGE_IO = {
 };
 const PIPELINE_STAGES = {
   interop:     ['expIn', 'wgpu', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
+  interopSR:   ['expIn', 'wgpu', 'destIn', 'dispSR', 'expOut', 'destOut', 'gpuWait'],
   interopNone: ['expIn', 'wgpu', 'destIn', 'expOut', 'destOut', 'gpuWait'],
   pass:        ['import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
   sr:          ['import', 'expIn', 'pre', 'destIn', 'dispSR', 'expOut', 'render', 'destOut', 'present'],
@@ -1337,9 +1340,14 @@ function renderPipelineDiagram() {
   const pipelineMode = $('pipelineSel').value;
   const isInterop = pipelineMode === 'interop';
   const dispatchMode = $('dispatchSel').value;
-  const modeKey = isInterop
-    ? (dispatchMode === 'none' ? 'interopNone' : 'interop')
-    : dispatchMode;
+  let modeKey;
+  if (isInterop) {
+    if (dispatchMode === 'none') modeKey = 'interopNone';
+    else if (dispatchMode === 'sr') modeKey = 'interopSR';
+    else modeKey = 'interop';
+  } else {
+    modeKey = dispatchMode;
+  }
   const stages = [...(PIPELINE_STAGES[modeKey] || PIPELINE_STAGES.sr)];
   const chips = $('chips');
   chips.innerHTML = '';
@@ -1387,14 +1395,6 @@ function updateDispatchUI() {
   const isInterop = $('pipelineSel').value === 'interop';
   $('flushSel').disabled = isInterop;
   $('stage').style.display = isInterop ? 'none' : '';
-
-  // Disable the SR option in interop mode (SR graph is full-pipeline only).
-  const srOption = [...$('dispatchSel').options].find((o) => o.value === 'sr');
-  if (srOption) srOption.disabled = isInterop;
-
-  if (isInterop) {
-    if ($('dispatchSel').value === 'sr') $('dispatchSel').value = 'pass';
-  }
 
   // Interop sizes its tensors by the Input resolution (ignoring the source), and
   // camera/test use it too; only a local file has a fixed native size.
