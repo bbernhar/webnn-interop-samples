@@ -272,6 +272,7 @@ const CHANNELS = 1;
 let adapter, device, gpuContext, canvasFormat;
 let currentAdapterKey = null; // tracks the powerPreference/fallback the device was created with
 let mlContext = null;
+let currentMLDeviceType = null;
 let interopPipeline;
 let passGraph = null;
 let srGraph = null;
@@ -552,7 +553,16 @@ async function initGPU() {
 
 async function initML(deviceType) {
   if (!navigator.ml) throw new Error('WebNN not available (navigator.ml missing).');
+  if (mlContext && currentMLDeviceType === deviceType) return;
+
+  if (srInputTensor) { srInputTensor.destroy(); srInputTensor = null; }
+  if (srOutputTensor) { srOutputTensor.destroy(); srOutputTensor = null; }
+  srGraph = null;
+  passGraph = null;
+  srGeom = null;
+
   mlContext = await navigator.ml.createContext({ deviceType });
+  currentMLDeviceType = deviceType;
   log(`WebNN context created (deviceType="${deviceType}").`, 'ok');
 
   // Probe tensor export / WebGPU interop support before committing to it.
@@ -1389,6 +1399,13 @@ function updateDispatchUI() {
   updateResolutionInfo();
 }
 $('sourceSel').addEventListener('change', updateSourceUI);
+$('deviceSel').addEventListener('change', () => {
+  srGeom = null;
+  srGraph = null;
+  passGraph = null;
+  if (srInputTensor) { srInputTensor.destroy(); srInputTensor = null; }
+  if (srOutputTensor) { srOutputTensor.destroy(); srOutputTensor = null; }
+});
 $('pipelineSel').addEventListener('change', () => { updateDispatchUI(); renderPipelineDiagram(); });
 $('dispatchSel').addEventListener('change', () => { srGeom = null; renderPipelineDiagram(); updateResolutionInfo(); });
 $('flushSel').addEventListener('change', () => { renderPipelineDiagram(); });
