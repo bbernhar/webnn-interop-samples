@@ -156,6 +156,13 @@
         <option value="interop">Interop only</option>
       </select>
     </label>
+    <label title="Choose the WebNN graph: Pass-through, Luma SSR (full pipeline only), or None (skips the dispatch call to isolate pipeline overhead).">WebNN graph
+      <select id="dispatchSel">
+        <option value="pass">Pass-through</option>
+        <option value="sr" selected>Luma SSR</option>
+        <option value="none">None</option>
+      </select>
+    </label>
     <label title="Full pipeline pacing mode: rAF (display-paced) or No rAF (unpaced). Interop-only always waits onSubmittedWorkDone.">Frame completion
       <select id="flushSel">
         <option value="off" selected title="Display-paced: waits for requestAnimationFrame each cycle.">rAF</option>
@@ -164,10 +171,11 @@
     </label>
     <label title="Frame resolution for the test pattern and the requested camera capture size (the camera snaps to its nearest supported mode). A local file uses its own native resolution.">Input resolution
       <select id="resSel">
-        <option value="426x240">240p</option>
+        <option value="360x240" selected>240p (360×240)</option>
+        <option value="426x240">240p (426×240, 16:9)</option>
         <option value="640x360">360p</option>
         <option value="854x480">480p</option>
-        <option value="1280x720" selected>720p</option>
+        <option value="1280x720">720p</option>
         <option value="1920x1080">1080p</option>
         <option value="2560x1440">1440p</option>
         <option value="3840x2160">2160p</option>
@@ -265,10 +273,11 @@ let adapter, device, gpuContext, canvasFormat;
 let currentAdapterKey = null; // tracks the powerPreference/fallback the device was created with
 let mlContext = null;
 let interopPipeline;
+let passGraph = null;
 let srGraph = null;
 let srInputTensor = null, srOutputTensor = null;
 let srPreprocPipeline, srRenderPipeline;
-let srGeom = null; // { frameW, frameH, tilesX, tilesY, numTiles, batch }
+let srGeom = null; // { frameW, frameH, tilesX, tilesY, numTiles, batch, dispatchMode }
 const SR_TILE_H = 240;
 const SR_TILE_W = 360;
 const SR_UPSCALE = 3;
@@ -312,6 +321,7 @@ struct Params {
   outW    : u32,
   outH    : u32,
   tileIdx : u32,
+  isSR    : u32,
 };
 `;
 
@@ -417,7 +427,14 @@ fn fs(in : VertexOutput) -> @location(0) vec4<f32> {
   let ox = min(u32(in.uv.x * f32(outTileW)), outTileW - 1u);
   let oy = min(u32(in.uv.y * f32(outTileH)), outTileH - 1u);
 
-  let ySr = f32(ioBuf[oy * outTileW + ox]);
+  var ySr : f32;
+  if (p.isSR == 1u) {
+    ySr = f32(ioBuf[oy * outTileW + ox]);
+  } else {
+    let ix = min(ox / 3u, p.tileW - 1u);
+    let iy = min(oy / 3u, p.tileH - 1u);
+    ySr = f32(ioBuf[iy * p.tileW + ix]);
+  }
 
   let srcCoord = vec2<u32>(
     min(u32(in.globalPx.x / 3.0), p.frameW - 1u),
@@ -617,41 +634,59 @@ async function buildSRGraph() {
   srGraph = await b.build({ output: b.add(baseline, value) });
 }
 
-// (Re)build the SSR graph + exportable tensors when the frame size changes.
-async function ensureSRResources() {
+// Minimal passthrough graph: a single multiply-by-1.
+async function buildPassThroughGraph() {
+  const b = new MLGraphBuilder(mlContext);
+  const input = b.input('input', {
+    dataType: 'float16',
+    shape: [1, 1, SR_TILE_H, SR_TILE_W],
+  });
+  const one = b.constant({ dataType: 'float16', shape: [1] }, new Float16Array([1.0]));
+  const output = b.mul(input, one);
+  passGraph = await b.build({ output });
+}
+
+// (Re)build the WebNN graph + exportable tensors when the frame size or dispatch mode changes.
+async function ensureResources() {
   const res = getResolution();
   const frameW = srcVideo.videoWidth || res.w;
   const frameH = srcVideo.videoHeight || res.h;
+  const dispatchMode = $('dispatchSel').value;
+  const isSR = dispatchMode === 'sr';
 
-  if (srGeom && srGeom.frameW === frameW && srGeom.frameH === frameH) return;
+  if (srGeom && srGeom.frameW === frameW && srGeom.frameH === frameH && srGeom.dispatchMode === dispatchMode) return;
 
   const tilesX = Math.ceil(frameW / SR_TILE_W);
   const tilesY = Math.ceil(frameH / SR_TILE_H);
   const numTiles = tilesX * tilesY;
   const batch = 1;
-  srGeom = { frameW, frameH, tilesX, tilesY, numTiles, batch };
+  srGeom = { frameW, frameH, tilesX, tilesY, numTiles, batch, dispatchMode };
 
   outCanvas.width = frameW * SR_UPSCALE;
   outCanvas.height = frameH * SR_UPSCALE;
 
-  if (!srGraph) {
+  if (isSR && !srGraph) {
     await buildSRGraph();
+  } else if (dispatchMode === 'pass' && !passGraph) {
+    await buildPassThroughGraph();
   }
-  if (!srInputTensor) {
-    srInputTensor = await mlContext.createExportableTensor(
-      {
-        dataType: 'float16',
-        shape: [1, 1, SR_TILE_H, SR_TILE_W],
-        writable: true,
-      }, device);
-  }
-  if (!srOutputTensor) {
-    srOutputTensor = await mlContext.createExportableTensor(
-      {
-        dataType: 'float16',
-        shape: [1, 1, SR_OUT_H, SR_OUT_W],
-      }, device);
-  }
+
+  if (srInputTensor) srInputTensor.destroy();
+  if (srOutputTensor) srOutputTensor.destroy();
+
+  srInputTensor = await mlContext.createExportableTensor(
+    {
+      dataType: 'float16',
+      shape: [1, 1, SR_TILE_H, SR_TILE_W],
+      writable: true,
+    }, device);
+
+  const outShape = isSR ? [1, 1, SR_OUT_H, SR_OUT_W] : [1, 1, SR_TILE_H, SR_TILE_W];
+  srOutputTensor = await mlContext.createExportableTensor(
+    {
+      dataType: 'float16',
+      shape: outShape,
+    }, device);
 
   // Create or update uniform buffers for each tile
   tileUniformBuffers = [];
@@ -670,19 +705,22 @@ async function ensureSRResources() {
       frameW * SR_UPSCALE,
       frameH * SR_UPSCALE,
       i,
+      isSR ? 1 : 0,
     ]);
     device.queue.writeBuffer(ub, 0, u);
     tileUniformBuffers.push(ub);
   }
 
-  log(`SSR resources ready: frame ${frameW}x${frameH}, ${numTiles} tiles (${tilesX}x${tilesY}) of ${SR_TILE_W}x${SR_TILE_H}, ` +
-      `batch 1 (Luma SR), output ${frameW * SR_UPSCALE}x${frameH * SR_UPSCALE}.`, 'ok');
+  log(`Resources ready: graph=${dispatchMode}, frame ${frameW}x${frameH}, ${numTiles} tiles (${tilesX}x${tilesY}) of ${SR_TILE_W}x${SR_TILE_H}, ` +
+      `output ${outCanvas.width}x${outCanvas.height}.`, 'ok');
 }
 
-// Per-frame SSR: preprocess (Luma extraction) -> WebNN dispatch -> GPU render (Luma + Chroma fusion) per tile.
-function processFrameSR() {
+// Per-frame pipeline: preprocess (Luma extraction) -> WebNN dispatch -> GPU render (Luma + Chroma fusion) per tile.
+function processFrame() {
   const metrics = { webgpuMs: 0, webnnMs: 0, transferMs: 0, ioMs: 0 };
-  const { numTiles } = srGeom;
+  const { numTiles, dispatchMode } = srGeom;
+  const isSR = dispatchMode === 'sr';
+  const currentGraph = isSR ? srGraph : passGraph;
   const wgX = Math.ceil(SR_TILE_W / 8);
   const wgY = Math.ceil(SR_TILE_H / 8);
 
@@ -722,7 +760,9 @@ function processFrameSR() {
     metrics.transferMs += performance.now() - tDestIn0;
 
     const tDisp0 = performance.now();
-    mlContext.dispatch(srGraph, { input: srInputTensor }, { output: srOutputTensor });
+    if (dispatchMode !== 'none') {
+      mlContext.dispatch(currentGraph, { input: srInputTensor }, { output: srOutputTensor });
+    }
     metrics.webnnMs += performance.now() - tDisp0;
 
     const tExpOut0 = performance.now();
@@ -856,6 +896,8 @@ async function measureInterop(reps) {
   const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
   const wgX = Math.min(wgTotal, maxDim);
   const wgY = Math.ceil(wgTotal / wgX);
+  const dispatchMode = $('dispatchSel').value;
+  const currentGraph = passGraph;
   let expInMs = 0, wgpuMs = 0, destInMs = 0, dispMs = 0, expOutMs = 0, destOutMs = 0;
   for (let i = 0; i < reps; i++) {
     const a = performance.now();
@@ -881,7 +923,9 @@ async function measureInterop(reps) {
     inBuf.destroy(); // ownership -> WebNN
     const c = performance.now(); destInMs += c - w;
 
-    mlContext.dispatch(srGraph, { input: srInputTensor }, { output: srOutputTensor });
+    if (dispatchMode !== 'none' && currentGraph) {
+      mlContext.dispatch(currentGraph, { input: srInputTensor }, { output: srOutputTensor });
+    }
     const d = performance.now(); dispMs += d - c;
 
     const outBuf = mlContext.exportToGPU(srOutputTensor);
@@ -920,7 +964,7 @@ async function runLoop() {
     const pipelineMode = $('pipelineSel').value;
     try {
       if (pipelineMode === 'interop') {
-        await ensureSRResources();
+        await ensureResources();
         const m = await measureInterop(INTEROP_REPS);
         frames++;
         expInSum += m.expInMs; wgpuSum += m.wgpuMs; destInSum += m.destInMs; dispSum += m.dispMs;
@@ -977,10 +1021,10 @@ async function runLoop() {
           frames = 0; expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
         }
       } else if (srcVideo.readyState >= 2 && srcVideo.videoWidth > 0) {
-        await ensureSRResources();
+        await ensureResources();
         const flush = $('flushSel').value; // 'off' = rAF-paced, 'offline' = no rAF pacing
         const t0 = performance.now();
-        const metrics = processFrameSR();
+        const metrics = processFrame();
         if (flush === 'off') {
           // No flush: pace on the next animation frame so the pipeline can
           // overlap frames (present happens naturally) -> throughput.
@@ -1044,6 +1088,7 @@ async function start() {
   try {
     console.log('[SR Benchmark] Start options', {
       pipeline: $('pipelineSel').value,
+      webnnGraph: $('dispatchSel').value,
       webnnDevice: $('deviceSel').value,
       webgpuAdapter: $('gpuSel').value,
       source: $('sourceSel').value,
@@ -1109,7 +1154,8 @@ const CHIP_META = {
   wgpu:    'WebGPU compute\n(tensor touch)',
   pre:     'WebGPU compute\n(Luma extract)',
   destIn:  'import',
-  disp:    'WebNN dispatch\n(Luma SSR)',
+  disp:    'WebNN dispatch\n(pass-through)',
+  dispSR:  'WebNN dispatch\n(Luma SSR)',
   expOut:  'exportToGPU',
   render:  'WebGPU render\n(Luma+Chroma fusion)',
   destOut: 'import',
@@ -1122,7 +1168,8 @@ const CHIP_CONV = {
   wgpu: 'compute pass',
   pre: 'tile + Y extract',
   destIn: 'return ownership',
-  disp: 'Luma 3x upscale',
+  disp: 'pass-through',
+  dispSR: 'Luma 3x upscale',
   expOut: 'export ownership',
   render: 'render + chroma fuse',
   destOut: 'return ownership',
@@ -1136,6 +1183,7 @@ const STAGE_IO = {
   pre: { in: 'GPUExternalTexture', inKind: 'texture', out: 'GPUBuffer', outKind: 'buffer' },
   destIn: { in: 'GPUBuffer', inKind: 'buffer', out: 'MLTensor(input)', outKind: 'tensor' },
   disp: { in: 'MLTensor(input)', inKind: 'tensor', out: 'MLTensor(output)', outKind: 'tensor' },
+  dispSR: { in: 'MLTensor(input)', inKind: 'tensor', out: 'MLTensor(output)', outKind: 'tensor' },
   expOut: { in: 'MLTensor(output)', inKind: 'tensor', out: 'GPUBuffer', outKind: 'buffer' },
   render: { in: 'GPUBuffer', inKind: 'buffer', out: 'Canvas', outKind: 'canvas' },
   destOut: { in: 'GPUBuffer', inKind: 'buffer', out: 'MLTensor(output)', outKind: 'tensor' },
@@ -1143,8 +1191,11 @@ const STAGE_IO = {
   gpuWait: { in: 'Queue work', inKind: 'sync', out: 'Completed', outKind: 'sync' },
 };
 const PIPELINE_STAGES = {
-  interop: ['expIn', 'wgpu', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
-  full: ['import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
+  interop:     ['expIn', 'wgpu', 'destIn', 'disp', 'expOut', 'destOut', 'gpuWait'],
+  interopNone: ['expIn', 'wgpu', 'destIn', 'expOut', 'destOut', 'gpuWait'],
+  pass:        ['import', 'expIn', 'pre', 'destIn', 'disp', 'expOut', 'render', 'destOut', 'present'],
+  sr:          ['import', 'expIn', 'pre', 'destIn', 'dispSR', 'expOut', 'render', 'destOut', 'present'],
+  none:        ['import', 'expIn', 'pre', 'destIn', 'expOut', 'render', 'destOut', 'present'],
 };
 const STAGE_DOMAIN = {
   present: 'io',
@@ -1158,6 +1209,7 @@ const STAGE_DOMAIN = {
   pre: 'webgpu',
   render: 'webgpu',
   disp: 'webnn',
+  dispSR: 'webnn',
 };
 function setChip(key, us) {
   const el = document.getElementById('val-' + key);
@@ -1201,6 +1253,7 @@ function getActiveSourceResolution() {
 }
 function updateResolutionInfo() {
   const pipelineMode = $('pipelineSel').value;
+  const dispatchMode = $('dispatchSel').value;
   const src = $('sourceSel').value;
   const srcRes = getActiveSourceResolution();
   const srcText = srcRes ? formatResolution(srcRes.w, srcRes.h)
@@ -1270,7 +1323,11 @@ function renderTileViz() {
 function renderPipelineDiagram() {
   const pipelineMode = $('pipelineSel').value;
   const isInterop = pipelineMode === 'interop';
-  const stages = [...PIPELINE_STAGES[pipelineMode]];
+  const dispatchMode = $('dispatchSel').value;
+  const modeKey = isInterop
+    ? (dispatchMode === 'none' ? 'interopNone' : 'interop')
+    : dispatchMode;
+  const stages = [...(PIPELINE_STAGES[modeKey] || PIPELINE_STAGES.sr)];
   const chips = $('chips');
   chips.innerHTML = '';
   stages.forEach((key, i) => {
@@ -1317,6 +1374,15 @@ function updateDispatchUI() {
   const isInterop = $('pipelineSel').value === 'interop';
   $('flushSel').disabled = isInterop;
   $('stage').style.display = isInterop ? 'none' : '';
+
+  // Disable the SR option in interop mode (SR graph is full-pipeline only).
+  const srOption = [...$('dispatchSel').options].find((o) => o.value === 'sr');
+  if (srOption) srOption.disabled = isInterop;
+
+  if (isInterop) {
+    if ($('dispatchSel').value === 'sr') $('dispatchSel').value = 'pass';
+  }
+
   // Interop sizes its tensors by the Input resolution (ignoring the source), and
   // camera/test use it too; only a local file has a fixed native size.
   $('resSel').disabled = !isInterop && $('sourceSel').value === 'file';
@@ -1324,6 +1390,7 @@ function updateDispatchUI() {
 }
 $('sourceSel').addEventListener('change', updateSourceUI);
 $('pipelineSel').addEventListener('change', () => { updateDispatchUI(); renderPipelineDiagram(); });
+$('dispatchSel').addEventListener('change', () => { srGeom = null; renderPipelineDiagram(); updateResolutionInfo(); });
 $('flushSel').addEventListener('change', () => { renderPipelineDiagram(); });
 $('resSel').addEventListener('change', () => { srGeom = null; updateResolutionInfo(); });
 srcVideo.addEventListener('loadedmetadata', updateResolutionInfo);
@@ -1340,15 +1407,17 @@ const URL_PARAMS = {
   device:     'deviceSel',
   adapter:    'gpuSel',
   pipeline:   'pipelineSel',
+  graph:      'dispatchSel',
   completion: 'flushSel',
   input:      'resSel',
   source:     'sourceSel',
 };
 const URL_PARAM_ALIASES = {
   input: ['inputres', 'res'],
+  graph: ['dispatch'],
 };
 const P_LABEL_TO_VALUE = {
-  '240p': '426x240',
+  '240p': '360x240',
   '360p': '640x360',
   '480p': '854x480',
   '720p': '1280x720',
