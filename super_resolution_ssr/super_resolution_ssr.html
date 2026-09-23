@@ -171,14 +171,10 @@
     </label>
     <label title="Frame resolution for the test pattern and the requested camera capture size (the camera snaps to its nearest supported mode). A local file uses its own native resolution.">Input resolution
       <select id="resSel">
-        <option value="360x240" selected>240p (360×240)</option>
-        <option value="426x240">240p (426×240, 16:9)</option>
-        <option value="640x360">360p</option>
-        <option value="854x480">480p</option>
-        <option value="1280x720">720p</option>
-        <option value="1920x1080">1080p</option>
-        <option value="2560x1440">1440p</option>
-        <option value="3840x2160">2160p</option>
+        <option value="360x240" selected>240p</option>
+        <option value="720x480">480p</option>
+        <option value="1080x720">720p</option>
+        <option value="1440x960">960p</option>
       </select>
     </label>
     <label>Source
@@ -1442,12 +1438,9 @@ const URL_PARAM_ALIASES = {
 };
 const P_LABEL_TO_VALUE = {
   '240p': '360x240',
-  '360p': '640x360',
-  '480p': '854x480',
-  '720p': '1280x720',
-  '1080p': '1920x1080',
-  '1440p': '2560x1440',
-  '2160p': '3840x2160',
+  '480p': '720x480',
+  '720p': '1080x720',
+  '960p': '1440x960',
 };
 function resolutionValueToLabel(value) {
   const [w, h] = String(value).split('x').map(Number);
