@@ -272,7 +272,8 @@ let currentMLDeviceType = null;
 let interopPipeline;
 let passGraph = null;
 let srGraph = null;
-let srInputTensor = null, srOutputTensor = null;
+let tileInputTensors = [];
+let tileOutputTensors = [];
 let srPreprocPipeline, srRenderPipeline;
 let srGeom = null; // { frameW, frameH, tilesX, tilesY, numTiles, batch, dispatchMode }
 const SR_TILE_H = 240;
@@ -283,6 +284,13 @@ const SR_OUT_W = SR_TILE_W * SR_UPSCALE;
 let uniformBuffer = null;
 let tileUniformBuffers = [];
 let scratchBuffer = null;
+
+function destroyTensors() {
+  for (const t of tileInputTensors) { if (t) t.destroy(); }
+  tileInputTensors = [];
+  for (const t of tileOutputTensors) { if (t) t.destroy(); }
+  tileOutputTensors = [];
+}
 
 // Repetitions per sample in interop-only mode (amortizes call + timer noise).
 const INTEROP_REPS = 64;
@@ -551,8 +559,7 @@ async function initML(deviceType) {
   if (!navigator.ml) throw new Error('WebNN not available (navigator.ml missing).');
   if (mlContext && currentMLDeviceType === deviceType) return;
 
-  if (srInputTensor) { srInputTensor.destroy(); srInputTensor = null; }
-  if (srOutputTensor) { srOutputTensor.destroy(); srOutputTensor = null; }
+  destroyTensors();
   srGraph = null;
   passGraph = null;
   srGeom = null;
@@ -677,22 +684,26 @@ async function ensureResources() {
     await buildPassThroughGraph();
   }
 
-  if (srInputTensor) srInputTensor.destroy();
-  if (srOutputTensor) srOutputTensor.destroy();
-
-  srInputTensor = await mlContext.createExportableTensor(
-    {
-      dataType: 'float16',
-      shape: [1, 1, SR_TILE_H, SR_TILE_W],
-      writable: true,
-    }, device);
+  destroyTensors();
 
   const outShape = isSR ? [1, 1, SR_OUT_H, SR_OUT_W] : [1, 1, SR_TILE_H, SR_TILE_W];
-  srOutputTensor = await mlContext.createExportableTensor(
-    {
-      dataType: 'float16',
-      shape: outShape,
-    }, device);
+
+  for (let i = 0; i < numTiles; i++) {
+    const inT = await mlContext.createExportableTensor(
+      {
+        dataType: 'float16',
+        shape: [1, 1, SR_TILE_H, SR_TILE_W],
+        writable: true,
+      }, device);
+    tileInputTensors.push(inT);
+
+    const outT = await mlContext.createExportableTensor(
+      {
+        dataType: 'float16',
+        shape: outShape,
+      }, device);
+    tileOutputTensors.push(outT);
+  }
 
   // Create or update uniform buffers for each tile
   tileUniformBuffers = [];
@@ -721,7 +732,14 @@ async function ensureResources() {
       `output ${outCanvas.width}x${outCanvas.height}.`, 'ok');
 }
 
-// Per-frame pipeline: preprocess (Luma extraction) -> WebNN dispatch -> GPU render (Luma + Chroma fusion) per tile.
+// Per-frame pipeline:
+//   1. Export all N input MLTensors to GPUBuffers.
+//   2. Encode and submit ALL N tile Luma extractions in a single WebGPU compute submit (Submit #1).
+//   3. Destroy input GPUBuffers (transfer ownership to WebNN).
+//   4. Asynchronously enqueue all N WebNN dispatches (batch = 1 per tile).
+//   5. Export all N output MLTensors to GPUBuffers.
+//   6. Encode and submit ALL N tile Chroma-fusion quad draws in a single WebGPU render pass/submit (Submit #2).
+//   7. Destroy output GPUBuffers (transfer ownership to WebNN).
 function processFrame() {
   const metrics = { webgpuMs: 0, webnnMs: 0, transferMs: 0, ioMs: 0 };
   const { numTiles, dispatchMode } = srGeom;
@@ -734,78 +752,96 @@ function processFrame() {
   const extTex = device.importExternalTexture({ source: srcVideo });
   metrics.ioMs += performance.now() - tImport0;
 
-  for (let tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
-    const tileUb = tileUniformBuffers[tileIdx];
+  // 1) Export all tile input tensors to GPU buffers
+  const tExpIn0 = performance.now();
+  const inBufs = [];
+  for (let i = 0; i < numTiles; i++) {
+    inBufs.push(mlContext.exportToGPU(tileInputTensors[i]));
+  }
+  metrics.transferMs += performance.now() - tExpIn0;
 
-    const tExpIn0 = performance.now();
-    const inBuf = mlContext.exportToGPU(srInputTensor);
-    metrics.transferMs += performance.now() - tExpIn0;
-
-    const tPre0 = performance.now();
+  // 2) Compute Pass: Extract luma for all tiles into their respective input buffers (1 GPU submit)
+  const tPre0 = performance.now();
+  const encPre = device.createCommandEncoder();
+  for (let i = 0; i < numTiles; i++) {
     const preBind = device.createBindGroup({
       layout: srPreprocPipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: extTex },
-        { binding: 1, resource: { buffer: inBuf } },
-        { binding: 2, resource: { buffer: tileUb } },
+        { binding: 1, resource: { buffer: inBufs[i] } },
+        { binding: 2, resource: { buffer: tileUniformBuffers[i] } },
       ],
     });
-    const enc = device.createCommandEncoder();
-    {
-      const pass = enc.beginComputePass();
-      pass.setPipeline(srPreprocPipeline);
-      pass.setBindGroup(0, preBind);
-      pass.dispatchWorkgroups(wgX, wgY, 1);
-      pass.end();
+    const pass = encPre.beginComputePass();
+    pass.setPipeline(srPreprocPipeline);
+    pass.setBindGroup(0, preBind);
+    pass.dispatchWorkgroups(wgX, wgY, 1);
+    pass.end();
+  }
+  device.queue.submit([encPre.finish()]);
+  metrics.webgpuMs += performance.now() - tPre0;
+
+  // 3) Destroy input GPU handles to return ownership to WebNN
+  const tDestIn0 = performance.now();
+  for (let i = 0; i < numTiles; i++) {
+    inBufs[i].destroy();
+  }
+  metrics.transferMs += performance.now() - tDestIn0;
+
+  // 4) WebNN: Enqueue N sequential dispatches (each is batch=1)
+  const tDisp0 = performance.now();
+  if (dispatchMode !== 'none' && currentGraph) {
+    for (let i = 0; i < numTiles; i++) {
+      mlContext.dispatch(currentGraph, { input: tileInputTensors[i] }, { output: tileOutputTensors[i] });
     }
-    device.queue.submit([enc.finish()]);
-    metrics.webgpuMs += performance.now() - tPre0;
+  }
+  metrics.webnnMs += performance.now() - tDisp0;
 
-    const tDestIn0 = performance.now();
-    inBuf.destroy(); // ownership -> WebNN
-    metrics.transferMs += performance.now() - tDestIn0;
+  // 5) Export all tile output tensors to GPU buffers
+  const tExpOut0 = performance.now();
+  const outBufs = [];
+  for (let i = 0; i < numTiles; i++) {
+    outBufs.push(mlContext.exportToGPU(tileOutputTensors[i]));
+  }
+  metrics.transferMs += performance.now() - tExpOut0;
 
-    const tDisp0 = performance.now();
-    if (dispatchMode !== 'none') {
-      mlContext.dispatch(currentGraph, { input: srInputTensor }, { output: srOutputTensor });
-    }
-    metrics.webnnMs += performance.now() - tDisp0;
-
-    const tExpOut0 = performance.now();
-    const outBuf = mlContext.exportToGPU(srOutputTensor);
-    metrics.transferMs += performance.now() - tExpOut0;
-
-    const tRender0 = performance.now();
-    const renderBind = device.createBindGroup({
-      layout: srRenderPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: outBuf } },
-        { binding: 1, resource: extTex },
-        { binding: 2, resource: { buffer: tileUb } },
-      ],
+  // 6) Render Pass: Draw all tiles with Chroma fusion in a single render pass (1 GPU submit)
+  const tRender0 = performance.now();
+  const encRender = device.createCommandEncoder();
+  {
+    const pass = encRender.beginRenderPass({
+      colorAttachments: [{
+        view: gpuContext.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
     });
-    const enc2 = device.createCommandEncoder();
-    {
-      const pass = enc2.beginRenderPass({
-        colorAttachments: [{
-          view: gpuContext.getCurrentTexture().createView(),
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          loadOp: tileIdx === 0 ? 'clear' : 'load',
-          storeOp: 'store',
-        }],
+    pass.setPipeline(srRenderPipeline);
+    for (let i = 0; i < numTiles; i++) {
+      const renderBind = device.createBindGroup({
+        layout: srRenderPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: outBufs[i] } },
+          { binding: 1, resource: extTex },
+          { binding: 2, resource: { buffer: tileUniformBuffers[i] } },
+        ],
       });
-      pass.setPipeline(srRenderPipeline);
       pass.setBindGroup(0, renderBind);
       pass.draw(6);
-      pass.end();
     }
-    device.queue.submit([enc2.finish()]);
-    metrics.webgpuMs += performance.now() - tRender0;
-
-    const tDestOut0 = performance.now();
-    outBuf.destroy(); // ownership -> WebNN
-    metrics.transferMs += performance.now() - tDestOut0;
+    pass.end();
   }
+  device.queue.submit([encRender.finish()]);
+  metrics.webgpuMs += performance.now() - tRender0;
+
+  // 7) Destroy output GPU handles to return ownership to WebNN
+  const tDestOut0 = performance.now();
+  for (let i = 0; i < numTiles; i++) {
+    outBufs[i].destroy();
+  }
+  metrics.transferMs += performance.now() - tDestOut0;
+
   return metrics;
 }
 
@@ -912,10 +948,12 @@ async function measureInterop(reps) {
   const dispatchMode = $('dispatchSel').value;
   const isSR = dispatchMode === 'sr';
   const currentGraph = isSR ? srGraph : passGraph;
+  const inTensor = tileInputTensors[0];
+  const outTensor = tileOutputTensors[0];
   let expInMs = 0, wgpuMs = 0, destInMs = 0, dispMs = 0, expOutMs = 0, destOutMs = 0;
   for (let i = 0; i < reps; i++) {
     const a = performance.now();
-    const inBuf = mlContext.exportToGPU(srInputTensor);
+    const inBuf = mlContext.exportToGPU(inTensor);
     const b = performance.now(); expInMs += b - a;
 
     // WebGPU compute dispatch over the exported input buffer (while WebGPU owns it).
@@ -938,11 +976,11 @@ async function measureInterop(reps) {
     const c = performance.now(); destInMs += c - w;
 
     if (dispatchMode !== 'none' && currentGraph) {
-      mlContext.dispatch(currentGraph, { input: srInputTensor }, { output: srOutputTensor });
+      mlContext.dispatch(currentGraph, { input: inTensor }, { output: outTensor });
     }
     const d = performance.now(); dispMs += d - c;
 
-    const outBuf = mlContext.exportToGPU(srOutputTensor);
+    const outBuf = mlContext.exportToGPU(outTensor);
     const e = performance.now(); expOutMs += e - d;
 
     if (i === reps - 1) {
@@ -1406,8 +1444,7 @@ $('deviceSel').addEventListener('change', () => {
   srGeom = null;
   srGraph = null;
   passGraph = null;
-  if (srInputTensor) { srInputTensor.destroy(); srInputTensor = null; }
-  if (srOutputTensor) { srOutputTensor.destroy(); srOutputTensor = null; }
+  destroyTensors();
 });
 $('pipelineSel').addEventListener('change', () => { updateDispatchUI(); renderPipelineDiagram(); });
 $('dispatchSel').addEventListener('change', () => { srGeom = null; renderPipelineDiagram(); updateResolutionInfo(); });
