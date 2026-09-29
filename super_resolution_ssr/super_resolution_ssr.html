@@ -123,13 +123,6 @@
   .legend .swatch-webnn { background: #3fbf7f; }
   .legend .swatch-transfer { background: #f2ad4f; }
   .legend .swatch-io { background: #7d8692; }
-
-  /* Frame tiling schematic */
-  #tileViz { margin: 4px 0 18px; }
-  #tileViz svg { display: block; }
-  #tileCaption { font-size: 12px; color: #9aa0a6; font-variant-numeric: tabular-nums; }
-  .section-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
-  .section-head .pipeline-title { margin-bottom: 0; }
 </style>
 </head>
 <body>
@@ -171,10 +164,7 @@
     </label>
     <label title="Frame resolution for the test pattern and the requested camera capture size (the camera snaps to its nearest supported mode). A local file uses its own native resolution.">Input resolution
       <select id="resSel">
-        <option value="360x240" selected>240p</option>
-        <option value="720x480">480p</option>
-        <option value="1080x720">720p</option>
-        <option value="1440x960">960p</option>
+        <option value="640x360" selected>360p</option>
       </select>
     </label>
     <label>Source
@@ -203,21 +193,13 @@
     </div>
   </div>
 
-  <div id="tileViz">
-    <div class="section-head">
-      <span class="pipeline-title">Frame</span>
-      <span id="tileCaption" class="stat"></span>
-    </div>
-    <svg id="tileSvg" width="0" height="0" aria-hidden="true"></svg>
-  </div>
-
   <div id="stage">
     <figure id="sourceFigure">
-      <figcaption>Source (decoded input) <span id="sourceInfo" class="stat"></span></figcaption>
+      <figcaption>Input</figcaption>
       <video id="srcVideo" width="480" height="270" muted playsinline loop></video>
     </figure>
     <figure>
-      <figcaption>Output (WebNN result, WebGPU render) <span id="targetInfo" class="stat"></span></figcaption>
+      <figcaption>Output</figcaption>
       <canvas id="outCanvas" width="1280" height="720"></canvas>
     </figure>
   </div>
@@ -232,15 +214,14 @@
 // interop path (single WebGPU submit per stage, single WebNN dispatch/frame):
 //
 //   VideoFrame -> GPUExternalTexture
-//        -> [preprocess.wgsl]  tile + BGR swizzle + layout pack -> exported input buffer
+//        -> [preprocess.wgsl]  full-frame Luma extract -> exported input buffer
 //        -> ml.exportToGPU(inTensor) / gpuBuffer.destroy()  (ownership handoff)
 //        -> ml.dispatch(graph, {input}, {output})           (WebNN dispatch)
 //        -> ml.exportToGPU(outTensor)
-//        -> [render.wgsl]      read output buffer directly: BGR->RGBA +
-//                              tile de-stitch -> canvas (no intermediate copy)
+//        -> [render.wgsl]      read output buffer directly: Luma+Chroma fusion
+//                              -> canvas (no intermediate copy)
 //
-// The WebNN graph reconstructs the analyzed FP16 SSR topology. Tiling, channel
-// order (BGR), and NCHW memory layout match the model contract.
+// The WebNN graph reconstructs the analyzed FP16 SSR topology with NCHW layout.
 // =============================================================================
 
 const $ = (id) => document.getElementById(id);
@@ -272,24 +253,21 @@ let currentMLDeviceType = null;
 let interopPipeline;
 let passGraph = null;
 let srGraph = null;
-let tileInputTensors = [];
-let tileOutputTensors = [];
+let srInputTensor = null;
+let srOutputTensor = null;
 let srPreprocPipeline, srRenderPipeline;
-let srGeom = null; // { frameW, frameH, tilesX, tilesY, numTiles, batch, dispatchMode }
-const SR_TILE_H = 240;
-const SR_TILE_W = 360;
+let srGeom = null; // { frameW, frameH, dispatchMode }
+const SR_IN_H = 360;
+const SR_IN_W = 640;
 const SR_UPSCALE = 3;
-const SR_OUT_H = SR_TILE_H * SR_UPSCALE;
-const SR_OUT_W = SR_TILE_W * SR_UPSCALE;
+const SR_OUT_H = SR_IN_H * SR_UPSCALE;
+const SR_OUT_W = SR_IN_W * SR_UPSCALE;
 let uniformBuffer = null;
-let tileUniformBuffers = [];
 let scratchBuffer = null;
 
 function destroyTensors() {
-  for (const t of tileInputTensors) { if (t) t.destroy(); }
-  tileInputTensors = [];
-  for (const t of tileOutputTensors) { if (t) t.destroy(); }
-  tileOutputTensors = [];
+  if (srInputTensor) { srInputTensor.destroy(); srInputTensor = null; }
+  if (srOutputTensor) { srOutputTensor.destroy(); srOutputTensor = null; }
 }
 
 // Repetitions per sample in interop-only mode (amortizes call + timer noise).
@@ -317,15 +295,10 @@ let offlineYieldCounter = 0;
 // =============================================================================
 const UNIFORM_WGSL = `
 struct Params {
-  tileW   : u32,
-  tileH   : u32,
-  tilesX  : u32,
-  tilesY  : u32,
   frameW  : u32,
   frameH  : u32,
   outW    : u32,
   outH    : u32,
-  tileIdx : u32,
   isSR    : u32,
 };
 `;
@@ -350,7 +323,7 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
 }
 `;
 
-// SSR preprocess: sample 240x360 tile Luma (Y) into the exported FP16 tensor.
+// SSR preprocess: sample 640x360 full-frame Luma (Y) into the exported FP16 tensor.
 const SR_PREPROCESS_WGSL = `
 enable f16;
 ` + UNIFORM_WGSL + `
@@ -362,22 +335,18 @@ enable f16;
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let gx = gid.x;
   let gy = gid.y;
-  if (gx >= p.tileW || gy >= p.tileH) { return; }
+  if (gx >= p.frameW || gy >= p.frameH) { return; }
 
-  let tileX = p.tileIdx % p.tilesX;
-  let tileY = p.tileIdx / p.tilesX;
-  let srcY = min(tileY * p.tileH + gy, p.frameH - 1u);
-  let srcX = min(tileX * p.tileW + gx, p.frameW - 1u);
-  let rgb = textureLoad(extTex, vec2<u32>(srcX, srcY)).rgb;
+  let rgb = textureLoad(extTex, vec2<u32>(gx, gy)).rgb;
 
   // Extract Luma Y (BT.601 / standard sRGB luma)
   let y = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
-  ioBuf[gy * p.tileW + gx] = f16(y);
+  ioBuf[gy * p.frameW + gx] = f16(y);
 }
 `;
 
 // SSR postprocess: read the FP16 Luma SR output, fuse with original Chroma (Cb, Cr),
-// and render the upscaled tile quad to the canvas.
+// and render the upscaled full quad to the canvas.
 const SR_RENDER_WGSL = `
 enable f16;
 ` + UNIFORM_WGSL + `
@@ -393,13 +362,6 @@ struct VertexOutput {
 
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> VertexOutput {
-  let tileX = f32(p.tileIdx % p.tilesX);
-  let tileY = f32(p.tileIdx / p.tilesX);
-  let outTileW = f32(p.tileW * 3u);
-  let outTileH = f32(p.tileH * 3u);
-  let outW = f32(p.outW);
-  let outH = f32(p.outH);
-
   var uvs = array<vec2<f32>, 6>(
     vec2<f32>(0.0, 0.0),
     vec2<f32>(1.0, 0.0),
@@ -409,11 +371,11 @@ fn vs(@builtin(vertex_index) vi : u32) -> VertexOutput {
     vec2<f32>(1.0, 1.0)
   );
   let uv = uvs[vi];
-  let px = tileX * outTileW + uv.x * outTileW;
-  let py = tileY * outTileH + uv.y * outTileH;
+  let px = uv.x * f32(p.outW);
+  let py = uv.y * f32(p.outH);
 
-  let ndcX = (px / outW) * 2.0 - 1.0;
-  let ndcY = 1.0 - (py / outH) * 2.0;
+  let ndcX = uv.x * 2.0 - 1.0;
+  let ndcY = 1.0 - uv.y * 2.0;
 
   var out : VertexOutput;
   out.pos = vec4<f32>(ndcX, ndcY, 0.0, 1.0);
@@ -427,18 +389,16 @@ fn fs(in : VertexOutput) -> @location(0) vec4<f32> {
   if (in.globalPx.x >= f32(p.outW) || in.globalPx.y >= f32(p.outH)) {
     discard;
   }
-  let outTileW = p.tileW * 3u;
-  let outTileH = p.tileH * 3u;
-  let ox = min(u32(in.uv.x * f32(outTileW)), outTileW - 1u);
-  let oy = min(u32(in.uv.y * f32(outTileH)), outTileH - 1u);
+  let ox = min(u32(in.uv.x * f32(p.outW)), p.outW - 1u);
+  let oy = min(u32(in.uv.y * f32(p.outH)), p.outH - 1u);
 
   var ySr : f32;
   if (p.isSR == 1u) {
-    ySr = f32(ioBuf[oy * outTileW + ox]);
+    ySr = f32(ioBuf[oy * p.outW + ox]);
   } else {
-    let ix = min(ox / 3u, p.tileW - 1u);
-    let iy = min(oy / 3u, p.tileH - 1u);
-    ySr = f32(ioBuf[iy * p.tileW + ix]);
+    let ix = min(ox / 3u, p.frameW - 1u);
+    let iy = min(oy / 3u, p.frameH - 1u);
+    ySr = f32(ioBuf[iy * p.frameW + ix]);
   }
 
   let srcCoord = vec2<u32>(
@@ -606,7 +566,7 @@ async function buildSRGraph() {
   const random = createRandom(0x53535231);
   const input = b.input('input', {
     dataType: 'float16',
-    shape: [1, 1, SR_TILE_H, SR_TILE_W],
+    shape: [1, 1, SR_IN_H, SR_IN_W],
   });
   const conv = (value, outputChannels, inputChannels, options = {}) => {
     const weights = randomFp16Constant(
@@ -631,7 +591,7 @@ async function buildSRGraph() {
     axes: [2, 3],
     sizes: [SR_OUT_H, SR_OUT_W],
   });
-  let value = prelu(conv(input, 32, 1, { strides: [3, 3] }), 32);
+  let value = prelu(conv(input, 32, 1, { strides: [3, 3], padding: [1, 1, 1, 1] }), 32);
   const block0 = value;
   value = prelu(conv(value, 32, 32, { padding: [1, 1, 1, 1] }), 32);
   value = prelu(conv(value, 32, 32, { padding: [1, 1, 1, 1] }), 32);
@@ -641,9 +601,10 @@ async function buildSRGraph() {
   value = prelu(conv(value, 32, 32, { padding: [1, 1, 1, 1] }), 32);
   value = prelu(b.add(block1, value), 32);
   value = prelu(conv(value, 36, 32, { padding: [1, 1, 1, 1] }), 36);
-  value = pixelShuffle(value, 4, 80, 120);
+  value = pixelShuffle(value, 4, 120, 214);
+  value = b.slice(value, [0, 0, 0, 0], [1, 4, SR_IN_H, SR_IN_W]);
   value = prelu(conv(value, 9, 4, { padding: [1, 1, 1, 1] }), 9);
-  value = pixelShuffle(value, 1, SR_TILE_H, SR_TILE_W);
+  value = pixelShuffle(value, 1, SR_IN_H, SR_IN_W);
   srGraph = await b.build({ output: b.add(baseline, value) });
 }
 
@@ -652,7 +613,7 @@ async function buildPassThroughGraph() {
   const b = new MLGraphBuilder(mlContext);
   const input = b.input('input', {
     dataType: 'float16',
-    shape: [1, 1, SR_TILE_H, SR_TILE_W],
+    shape: [1, 1, SR_IN_H, SR_IN_W],
   });
   const one = b.constant({ dataType: 'float16', shape: [1] }, new Float16Array([1.0]));
   const output = b.mul(input, one);
@@ -661,19 +622,14 @@ async function buildPassThroughGraph() {
 
 // (Re)build the WebNN graph + exportable tensors when the frame size or dispatch mode changes.
 async function ensureResources() {
-  const res = getResolution();
-  const frameW = srcVideo.videoWidth || res.w;
-  const frameH = srcVideo.videoHeight || res.h;
+  const frameW = SR_IN_W;
+  const frameH = SR_IN_H;
   const dispatchMode = $('dispatchSel').value;
   const isSR = dispatchMode === 'sr';
 
   if (srGeom && srGeom.frameW === frameW && srGeom.frameH === frameH && srGeom.dispatchMode === dispatchMode) return;
 
-  const tilesX = Math.ceil(frameW / SR_TILE_W);
-  const tilesY = Math.ceil(frameH / SR_TILE_H);
-  const numTiles = tilesX * tilesY;
-  const batch = 1;
-  srGeom = { frameW, frameH, tilesX, tilesY, numTiles, batch, dispatchMode };
+  srGeom = { frameW, frameH, dispatchMode };
 
   outCanvas.width = frameW * SR_UPSCALE;
   outCanvas.height = frameH * SR_UPSCALE;
@@ -686,130 +642,106 @@ async function ensureResources() {
 
   destroyTensors();
 
-  const outShape = isSR ? [1, 1, SR_OUT_H, SR_OUT_W] : [1, 1, SR_TILE_H, SR_TILE_W];
+  const outShape = isSR ? [1, 1, SR_OUT_H, SR_OUT_W] : [1, 1, SR_IN_H, SR_IN_W];
 
-  for (let i = 0; i < numTiles; i++) {
-    const inT = await mlContext.createExportableTensor(
-      {
-        dataType: 'float16',
-        shape: [1, 1, SR_TILE_H, SR_TILE_W],
-        writable: true,
-      }, device);
-    tileInputTensors.push(inT);
+  srInputTensor = await mlContext.createExportableTensor(
+    {
+      dataType: 'float16',
+      shape: [1, 1, SR_IN_H, SR_IN_W],
+      writable: true,
+    }, device);
 
-    const outT = await mlContext.createExportableTensor(
-      {
-        dataType: 'float16',
-        shape: outShape,
-      }, device);
-    tileOutputTensors.push(outT);
-  }
+  srOutputTensor = await mlContext.createExportableTensor(
+    {
+      dataType: 'float16',
+      shape: outShape,
+    }, device);
 
-  // Create or update uniform buffers for each tile
-  tileUniformBuffers = [];
-  for (let i = 0; i < numTiles; i++) {
-    const ub = device.createBuffer({
-      size: 48,
+  if (!uniformBuffer) {
+    uniformBuffer = device.createBuffer({
+      size: 32, // 5 x u32 (rounded to 32)
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    const u = new Uint32Array([
-      SR_TILE_W,
-      SR_TILE_H,
-      tilesX,
-      tilesY,
-      frameW,
-      frameH,
-      frameW * SR_UPSCALE,
-      frameH * SR_UPSCALE,
-      i,
-      isSR ? 1 : 0,
-    ]);
-    device.queue.writeBuffer(ub, 0, u);
-    tileUniformBuffers.push(ub);
   }
+  const u = new Uint32Array([
+    frameW,
+    frameH,
+    frameW * SR_UPSCALE,
+    frameH * SR_UPSCALE,
+    isSR ? 1 : 0,
+  ]);
+  device.queue.writeBuffer(uniformBuffer, 0, u);
 
-  log(`Resources ready: graph=${dispatchMode}, frame ${frameW}x${frameH}, ${numTiles} tiles (${tilesX}x${tilesY}) of ${SR_TILE_W}x${SR_TILE_H}, ` +
+  log(`Resources ready: graph=${dispatchMode}, frame ${frameW}x${frameH}, ` +
       `output ${outCanvas.width}x${outCanvas.height}.`, 'ok');
 }
 
 // Per-frame pipeline:
-//   1. Export all N input MLTensors to GPUBuffers.
-//   2. Encode and submit ALL N tile Luma extractions in a single WebGPU compute submit (Submit #1).
-//   3. Destroy input GPUBuffers (transfer ownership to WebNN).
-//   4. Asynchronously enqueue all N WebNN dispatches (batch = 1 per tile).
-//   5. Export all N output MLTensors to GPUBuffers.
-//   6. Encode and submit ALL N tile Chroma-fusion quad draws in a single WebGPU render pass/submit (Submit #2).
-//   7. Destroy output GPUBuffers (transfer ownership to WebNN).
+//   1. Export input MLTensor to GPUBuffer.
+//   2. Encode and submit full-frame Luma extraction in WebGPU compute submit (Submit #1).
+//   3. Destroy input GPUBuffer (transfer ownership to WebNN).
+//   4. Asynchronously enqueue single full-frame WebNN dispatch (batch = 1).
+//   5. Export output MLTensor to GPUBuffer.
+//   6. Encode and submit full-frame Chroma-fusion quad draw in WebGPU render pass/submit (Submit #2).
+//   7. Destroy output GPUBuffer (transfer ownership to WebNN).
 function processFrame() {
   const metrics = { webgpuMs: 0, webnnMs: 0, transferMs: 0, ioMs: 0 };
-  const { numTiles, dispatchMode } = srGeom;
+  const { dispatchMode } = srGeom;
   const isSR = dispatchMode === 'sr';
   const currentGraph = isSR ? srGraph : passGraph;
-  const wgX = Math.ceil(SR_TILE_W / 8);
-  const wgY = Math.ceil(SR_TILE_H / 8);
+  const wgX = Math.ceil(SR_IN_W / 8);
+  const wgY = Math.ceil(SR_IN_H / 8);
 
   const tImport0 = performance.now();
   const extTex = device.importExternalTexture({ source: srcVideo });
   metrics.ioMs += performance.now() - tImport0;
 
-  // 1) Export all tile input tensors to GPU buffers
+  // 1) Export input tensor to GPU buffer
   const tExpIn0 = performance.now();
-  const inBufs = [];
-  for (let i = 0; i < numTiles; i++) {
-    inBufs.push(mlContext.exportToGPU(tileInputTensors[i]));
-  }
+  const inBuf = mlContext.exportToGPU(srInputTensor);
   metrics.transferMs += performance.now() - tExpIn0;
 
-  // 2) Compute Pass: Extract luma for all tiles into their respective input buffers (1 GPU submit)
+  // 2) Compute Pass: Extract full-frame luma into input buffer (1 GPU submit)
   const tPre0 = performance.now();
   const encPre = device.createCommandEncoder();
-  for (let i = 0; i < numTiles; i++) {
-    const preBind = device.createBindGroup({
-      layout: srPreprocPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: extTex },
-        { binding: 1, resource: { buffer: inBufs[i] } },
-        { binding: 2, resource: { buffer: tileUniformBuffers[i] } },
-      ],
-    });
-    const pass = encPre.beginComputePass();
-    pass.setPipeline(srPreprocPipeline);
-    pass.setBindGroup(0, preBind);
-    pass.dispatchWorkgroups(wgX, wgY, 1);
-    pass.end();
-  }
+  const preBind = device.createBindGroup({
+    layout: srPreprocPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: extTex },
+      { binding: 1, resource: { buffer: inBuf } },
+      { binding: 2, resource: { buffer: uniformBuffer } },
+    ],
+  });
+  const pass = encPre.beginComputePass();
+  pass.setPipeline(srPreprocPipeline);
+  pass.setBindGroup(0, preBind);
+  pass.dispatchWorkgroups(wgX, wgY, 1);
+  pass.end();
   device.queue.submit([encPre.finish()]);
   metrics.webgpuMs += performance.now() - tPre0;
 
-  // 3) Destroy input GPU handles to return ownership to WebNN
+  // 3) Destroy input GPU handle to return ownership to WebNN
   const tDestIn0 = performance.now();
-  for (let i = 0; i < numTiles; i++) {
-    inBufs[i].destroy();
-  }
+  inBuf.destroy();
   metrics.transferMs += performance.now() - tDestIn0;
 
-  // 4) WebNN: Enqueue N sequential dispatches (each is batch=1)
+  // 4) WebNN: Enqueue single dispatch (batch = 1 full frame)
   const tDisp0 = performance.now();
   if (dispatchMode !== 'none' && currentGraph) {
-    for (let i = 0; i < numTiles; i++) {
-      mlContext.dispatch(currentGraph, { input: tileInputTensors[i] }, { output: tileOutputTensors[i] });
-    }
+    mlContext.dispatch(currentGraph, { input: srInputTensor }, { output: srOutputTensor });
   }
   metrics.webnnMs += performance.now() - tDisp0;
 
-  // 5) Export all tile output tensors to GPU buffers
+  // 5) Export output tensor to GPU buffer
   const tExpOut0 = performance.now();
-  const outBufs = [];
-  for (let i = 0; i < numTiles; i++) {
-    outBufs.push(mlContext.exportToGPU(tileOutputTensors[i]));
-  }
+  const outBuf = mlContext.exportToGPU(srOutputTensor);
   metrics.transferMs += performance.now() - tExpOut0;
 
-  // 6) Render Pass: Draw all tiles with Chroma fusion in a single render pass (1 GPU submit)
+  // 6) Render Pass: Draw full frame with Chroma fusion (1 GPU submit)
   const tRender0 = performance.now();
   const encRender = device.createCommandEncoder();
   {
-    const pass = encRender.beginRenderPass({
+    const renderPass = encRender.beginRenderPass({
       colorAttachments: [{
         view: gpuContext.getCurrentTexture().createView(),
         clearValue: { r: 0, g: 0, b: 0, a: 1 },
@@ -817,29 +749,25 @@ function processFrame() {
         storeOp: 'store',
       }],
     });
-    pass.setPipeline(srRenderPipeline);
-    for (let i = 0; i < numTiles; i++) {
-      const renderBind = device.createBindGroup({
-        layout: srRenderPipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: outBufs[i] } },
-          { binding: 1, resource: extTex },
-          { binding: 2, resource: { buffer: tileUniformBuffers[i] } },
-        ],
-      });
-      pass.setBindGroup(0, renderBind);
-      pass.draw(6);
-    }
-    pass.end();
+    renderPass.setPipeline(srRenderPipeline);
+    const renderBind = device.createBindGroup({
+      layout: srRenderPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: outBuf } },
+        { binding: 1, resource: extTex },
+        { binding: 2, resource: { buffer: uniformBuffer } },
+      ],
+    });
+    renderPass.setBindGroup(0, renderBind);
+    renderPass.draw(6);
+    renderPass.end();
   }
   device.queue.submit([encRender.finish()]);
   metrics.webgpuMs += performance.now() - tRender0;
 
-  // 7) Destroy output GPU handles to return ownership to WebNN
+  // 7) Destroy output GPU handle to return ownership to WebNN
   const tDestOut0 = performance.now();
-  for (let i = 0; i < numTiles; i++) {
-    outBufs[i].destroy();
-  }
+  outBuf.destroy();
   metrics.transferMs += performance.now() - tDestOut0;
 
   return metrics;
@@ -940,7 +868,7 @@ function stopSource() {
 //   dispatchPerCycleMs- the WebNN dispatch call (queueing cost, not execution)
 //   gpuWaitPerCycleMs - backend completion wait (onSubmittedWorkDone)
 async function measureInterop(reps) {
-  const elements = SR_TILE_H * SR_TILE_W;
+  const elements = SR_IN_H * SR_IN_W;
   const wgTotal = Math.ceil(elements / 256);
   const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
   const wgX = Math.min(wgTotal, maxDim);
@@ -948,8 +876,8 @@ async function measureInterop(reps) {
   const dispatchMode = $('dispatchSel').value;
   const isSR = dispatchMode === 'sr';
   const currentGraph = isSR ? srGraph : passGraph;
-  const inTensor = tileInputTensors[0];
-  const outTensor = tileOutputTensors[0];
+  const inTensor = srInputTensor;
+  const outTensor = srOutputTensor;
   let expInMs = 0, wgpuMs = 0, destInMs = 0, dispMs = 0, expOutMs = 0, destOutMs = 0;
   for (let i = 0; i < reps; i++) {
     const a = performance.now();
@@ -1069,7 +997,7 @@ async function runLoop() {
           setChip('disp', adsp); setChip('dispSR', adsp);
           setChip('expOut', aeOut); setChip('destOut', adOut); setChip('gpuWait', agpu);
           $('spanLabel').textContent =
-            `Iteration = ${(avgTotal / 1000).toFixed(1)} ms (avg ${ROLLING_WINDOW_MS / 1000}s) · ${(total / 1000).toFixed(1)} ms (current) (×${INTEROP_REPS})`;
+            `Iteration (avg) = ${(avgTotal / 1000).toFixed(1)} ms`;
           updateTotalsInfo({ webgpuUs: awgp, webnnUs: adsp, transferUs: transferSum, ioUs: agpu });
           frames = 0; expInSum = 0; wgpuSum = 0; destInSum = 0; dispSum = 0; expOutSum = 0; destOutSum = 0; gpuWaitSum = 0; lastFpsTime = now;
         }
@@ -1111,13 +1039,8 @@ async function runLoop() {
           for (const s of frameSamples) sumDtMs += s.dtMs;
           const rollingFps = sumDtMs > 0 ? (frameSamples.length * 1000) / sumDtMs : 0;
           const fps = (frames * 1000) / (now - lastFpsTime);
-          if (flush === 'off') {
-            $('spanLabel').textContent =
-              `Frame rate = ${rollingFps.toFixed(1)} fps (avg ${ROLLING_WINDOW_MS / 1000}s) · ${fps.toFixed(1)} fps (current)`;
-          } else {
-            $('spanLabel').textContent =
-              `Frame rate = ${rollingFps.toFixed(1)} fps (avg ${ROLLING_WINDOW_MS / 1000}s) · ${fps.toFixed(1)} fps (current)`;
-          }
+          $('spanLabel').textContent =
+            `Frame rate (avg) = ${rollingFps.toFixed(1)} fps`;
           frames = 0;
           lastFpsTime = now;
         }
@@ -1219,7 +1142,7 @@ const CHIP_CONV = {
   import: 'import video texture',
   expIn: 'export ownership',
   wgpu: 'compute pass',
-  pre: 'tile + Y extract',
+  pre: 'full-frame Y extract',
   destIn: 'return ownership',
   disp: 'pass-through',
   dispSR: 'Luma 3x upscale',
@@ -1326,54 +1249,8 @@ function updateResolutionInfo() {
   if (targetEl) targetEl.textContent = `\u2192 ${targetText}`;
   const sourceEl = $('sourceInfo');
   if (sourceEl) sourceEl.textContent = `\u2192 ${srcText}`;
-  renderTileViz();
 }
-function getActiveTile() {
-  return { w: SR_TILE_W, h: SR_TILE_H };
-}
-// Draw a clean, aspect-correct schematic of the source frame split into tiles of
-// the active format, including the clamp-padded edge region beyond the frame.
-function renderTileViz() {
-  const svg = $('tileSvg');
-  if (!svg) return;
-  const res = getActiveSourceResolution() || getResolution();
-  const frameW = res.w, frameH = res.h;
-  const { w: tw, h: th } = getActiveTile();
-  const tilesX = Math.ceil(frameW / tw);
-  const tilesY = Math.ceil(frameH / th);
-  const numTiles = tilesX * tilesY;
-  const gridW = tilesX * tw, gridH = tilesY * th; // padded extent (>= frame)
 
-  const MAXW = 300, MAXH = 190;
-  const scale = Math.min(MAXW / gridW, MAXH / gridH);
-  const W = Math.max(1, Math.round(gridW * scale));
-  const H = Math.max(1, Math.round(gridH * scale));
-  const fw = Math.round(frameW * scale), fh = Math.round(frameH * scale);
-  svg.setAttribute('width', W);
-  svg.setAttribute('height', H);
-  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
-
-  const p = [];
-  // Padded grid area (amber tint marks clamp-padding beyond the frame).
-  p.push(`<rect x="0" y="0" width="${W}" height="${H}" fill="rgba(242,173,79,0.10)"/>`);
-  // Actual frame content area.
-  p.push(`<rect x="0" y="0" width="${fw}" height="${fh}" fill="#1c1f24"/>`);
-  // Tile grid lines.
-  for (let i = 1; i < tilesX; i++) {
-    const x = Math.round(i * tw * scale);
-    p.push(`<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="#4c8df6" stroke-width="1" opacity="0.55"/>`);
-  }
-  for (let j = 1; j < tilesY; j++) {
-    const y = Math.round(j * th * scale);
-    p.push(`<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="#4c8df6" stroke-width="1" opacity="0.55"/>`);
-  }
-  // Frame outline + outer grid outline.
-  p.push(`<rect x="0.75" y="0.75" width="${fw - 1.5}" height="${fh - 1.5}" fill="none" stroke="#5c9ded" stroke-width="1.5"/>`);
-  p.push(`<rect x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" fill="none" stroke="#33373d"/>`);
-  svg.innerHTML = p.join('');
-
-  $('tileCaption').textContent = `${frameW}\u00d7${frameH}`;
-}
 function renderPipelineDiagram() {
   const pipelineMode = $('pipelineSel').value;
   const isInterop = pipelineMode === 'interop';
@@ -1424,9 +1301,6 @@ function updateSourceUI() {
   // local file uses its own native size. Interop ignores the source and sizes
   // its tensors by this resolution, so keep it enabled there too.
   $('resSel').disabled = !isInterop && src === 'file';
-  // The Source preview is only informative for real inputs (camera / file); the
-  // test pattern is self-generated, so hide its (redundant) preview.
-  $('sourceFigure').style.display = src === 'test' ? 'none' : '';
   updateResolutionInfo();
 }
 function updateDispatchUI() {
@@ -1474,10 +1348,7 @@ const URL_PARAM_ALIASES = {
   graph: ['dispatch'],
 };
 const P_LABEL_TO_VALUE = {
-  '240p': '360x240',
-  '480p': '720x480',
-  '720p': '1080x720',
-  '960p': '1440x960',
+  '360p': '640x360',
 };
 function resolutionValueToLabel(value) {
   const [w, h] = String(value).split('x').map(Number);
