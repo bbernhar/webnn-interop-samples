@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YUV Plane Recovery</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    padding: 16px 20px;
+    font-family: system-ui, Segoe UI, Arial, sans-serif;
+    background: #14161a;
+    color: #e8eaed;
+  }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+  label { font-size: 13px; display: inline-flex; gap: 6px; align-items: center; }
+  select, button, input[type=file] { font-size: 13px; padding: 6px 8px; }
+  button { cursor: pointer; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  #stage { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+  figure { margin: 0; }
+  figcaption { font-size: 12px; color: #9aa0a6; margin-bottom: 4px; }
+  canvas {
+    width: min(32vw, 640px);
+    height: auto;
+    background: #000;
+    border: 1px solid #33373d;
+    image-rendering: pixelated;
+  }
+  #info { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 12px; margin-top: 12px; }
+  pre {
+    margin: 0; font-size: 12px; white-space: pre-wrap;
+    background: #1c1f24; border: 1px solid #33373d; border-radius: 6px;
+    padding: 10px; font-family: Consolas, monospace;
+  }
+  #log { margin-top: 12px; max-height: 180px; overflow: auto; }
+  .err { color: #ff8a80; }
+  .ok { color: #a5d6a7; }
+</style>
+</head>
+<body>
+  <h1>YUV Plane Recovery from External Texture</h1>
+
+  <div class="row">
+    <label title="WebGPU adapter power preference">WebGPU adapter
+      <select id="gpuSel">
+        <option value="default" selected>default</option>
+        <option value="high-performance">high-performance</option>
+        <option value="low-power">low-power</option>
+        <option value="fallback">fallback (software)</option>
+      </select>
+    </label>
+    <label title="The capture samples both luma-pixel centers and chroma-texel centers.">External sample filter
+      <select id="filterSel">
+        <option value="linear">linear</option>
+        <option value="nearest" selected>nearest</option>
+      </select>
+    </label>
+    <button id="runBtn">Run</button>
+    <button id="copyLinkBtn" title="Copy a URL that reproduces the current configuration">Copy link</button>
+  </div>
+
+  <div id="info">
+    <pre id="planeStats">Plane recovery vs VideoFrame.copyTo(): (run to populate)</pre>
+    <pre id="srcMeta">Source metadata: (run to populate)</pre>
+  </div>
+
+  <pre id="log"></pre>
+
+<script type="module">
+// =============================================================================
+// YUV plane recovery workload.
+//
+//   camera snapshot -> YUV VideoFrame (NV12/I420)
+//     Source:      importExternalTexture(frame) -> browser YUV->RGB -> float storage buffers
+//     Recovery:    inverse color conversion -> estimated Y/UV code values
+//     Reference:   frame.copyTo -> original Y/UV code values
+// =============================================================================
+
+const $ = (id) => document.getElementById(id);
+function log(msg, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  $('log').appendChild(line);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+const CAMERA_WIDTH = 1920;
+const CAMERA_HEIGHT = 1080;
+
+let adapter = null, device = null, adapterKey = null;
+let pipelines = null;
+let lastRun = null; // { refTex, refRgbBuf, refUvRgbBuf }
+
+// =============================================================================
+// WGSL.
+// =============================================================================
+const FULLSCREEN_VS = `
+@vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4f {
+  let p = array(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+`;
+
+const REF_WGSL = FULLSCREEN_VS + `
+@group(0) @binding(0) var ext : texture_external;
+@group(0) @binding(1) var samp : sampler;
+@group(0) @binding(2) var<uniform> size : vec4f;
+@group(0) @binding(3) var<storage, read_write> rgbOut : array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> uvRgbOut : array<vec4f>;
+@fragment fn fs(@builtin(position) pos : vec4f) -> @location(0) vec4f {
+  let rgb = textureSampleBaseClampToEdge(ext, samp, pos.xy / size.xy).rgb;
+  let pixel = vec2u(pos.xy);
+  let index = pixel.y * u32(size.x) + pixel.x;
+  rgbOut[index] = vec4f(rgb, 1.0);
+  if (pixel.x % 2u == 0u && pixel.y % 2u == 0u) {
+    let chromaCoord = (pos.xy + vec2f(0.5)) / size.xy;
+    let chromaRgb = textureSampleBaseClampToEdge(ext, samp, chromaCoord).rgb;
+    let chromaIndex = (pixel.y / 2u) * (u32(size.x) / 2u) + pixel.x / 2u;
+    uvRgbOut[chromaIndex] = vec4f(chromaRgb, 1.0);
+  }
+  return vec4f(rgb, 1.0);
+}
+`;
+
+const KR_KB = {
+  bt709: [0.2126, 0.0722],
+  bt470bg: [0.299, 0.114],
+  smpte170m: [0.299, 0.114],
+  'bt2020-ncl': [0.2627, 0.0593],
+};
+const PRIMARIES = {
+  bt709: [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]],
+  bt470bg: [[0.64, 0.33], [0.29, 0.60], [0.15, 0.06]],
+  smpte170m: [[0.630, 0.340], [0.310, 0.595], [0.155, 0.070]],
+  bt2020: [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]],
+  smpte432: [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060]],
+};
+const D65 = [0.3127, 0.3290];
+
+function inv3(m) {
+  const [a, b, c] = m[0], [d, e, f] = m[1], [g, h, i] = m[2];
+  const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+  const det = a * A + b * B + c * C;
+  return [
+    [A / det, -(b * i - c * h) / det, (b * f - c * e) / det],
+    [B / det, (a * i - c * g) / det, -(a * f - c * d) / det],
+    [C / det, -(a * h - b * g) / det, (a * e - b * d) / det],
+  ];
+}
+
+function mul3(a, b) {
+  return a.map((row) => [0, 1, 2].map((j) => row[0] * b[0][j] + row[1] * b[1][j] + row[2] * b[2][j]));
+}
+
+function rgbToXyz(primaries) {
+  const xyz = ([x, y]) => [x / y, 1, (1 - x - y) / y];
+  const cols = primaries.map(xyz);
+  const matrix = [0, 1, 2].map((row) => cols.map((col) => col[row]));
+  const white = xyz(D65);
+  const scale = inv3(matrix).map((row) => row[0] * white[0] + row[1] * white[1] + row[2] * white[2]);
+  return matrix.map((row) => row.map((value, col) => value * scale[col]));
+}
+
+function colorParams(colorSpace) {
+  const fallbacks = [];
+  let { matrix, fullRange, primaries, transfer } = colorSpace;
+  if (matrix == null) { matrix = 'bt709'; fallbacks.push('matrix=null -> bt709'); }
+  if (fullRange == null) { fullRange = false; fallbacks.push('fullRange=null -> limited'); }
+  if (primaries == null || !PRIMARIES[primaries]) {
+    primaries = 'bt709';
+    fallbacks.push('unknown primaries -> bt709');
+  }
+  if (transfer == null) { transfer = 'bt709'; fallbacks.push('transfer=null -> bt709'); }
+
+  const ys = fullRange ? 1 : 255 / 219;
+  const yo = fullRange ? 0 : -16 / 219;
+  const chromaScale = fullRange ? 1 : 255 / 224;
+  const chromaOffset = -128 / 255 * chromaScale;
+  let rows;
+  if (matrix === 'rgb') {
+    rows = [[0, 0, 1, 0], [1, 0, 0, 0], [0, 1, 0, 0]];
+  } else {
+    if (!KR_KB[matrix]) {
+      fallbacks.push(`unknown matrix ${matrix} -> bt709`);
+      matrix = 'bt709';
+    }
+    const [kr, kb] = KR_KB[matrix];
+    const kg = 1 - kr - kb;
+    const rv = 2 * (1 - kr), bu = 2 * (1 - kb);
+    const gu = 2 * kb * (1 - kb) / kg, gv = 2 * kr * (1 - kr) / kg;
+    rows = [
+      [ys, 0, rv * chromaScale, yo + rv * chromaOffset],
+      [ys, -gu * chromaScale, -gv * chromaScale, yo - (gu + gv) * chromaOffset],
+      [ys, bu * chromaScale, 0, yo + bu * chromaOffset],
+    ];
+  }
+
+  const sourceToXyz = rgbToXyz(PRIMARIES[primaries]);
+  const destinationFromXyz = inv3(rgbToXyz(PRIMARIES.bt709));
+  const gamut = mul3(destinationFromXyz, sourceToXyz);
+  const conversionOnly = primaries === 'bt709' && transfer === 'iec61966-2-1';
+  return { matrix, fullRange, primaries, transfer, rows, gamut, conversionOnly, fallbacks };
+}
+
+function applyMatrix3(matrix, x, y, z) {
+  return [
+    matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z,
+    matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z,
+    matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z,
+  ];
+}
+
+function srgbToLinearValue(value) {
+  const magnitude = Math.abs(value);
+  return Math.sign(value) * (magnitude <= 0.04045 ? magnitude / 12.92 : ((magnitude + 0.055) / 1.055) ** 2.4);
+}
+
+function sourceOetf(value, transfer) {
+  if (transfer === 'linear') return value;
+  const magnitude = Math.abs(value);
+  const sign = Math.sign(value);
+  if (transfer === 'bt709' || transfer === 'smpte170m') {
+    return sign * (magnitude < 0.018 ? 4.5 * magnitude : 1.099 * magnitude ** 0.45 - 0.099);
+  }
+  if (transfer === 'iec61966-2-1') {
+    return sign * (magnitude <= 0.0031308 ? 12.92 * magnitude : 1.055 * magnitude ** (1 / 2.4) - 0.055);
+  }
+  return NaN;
+}
+
+function comparePlaneCodes(recovered, copied) {
+  let mismatches = 0;
+  let maxError = 0;
+  let maxRoundedError = 0;
+  for (let i = 0; i < copied.length; i++) {
+    const error = Math.abs(recovered[i] - copied[i]);
+    const roundedError = Math.abs(Math.round(recovered[i]) - copied[i]);
+    if (roundedError) mismatches++;
+    maxError = Math.max(maxError, error);
+    maxRoundedError = Math.max(maxRoundedError, roundedError);
+  }
+  return { mismatches, maxError, maxRoundedError, total: copied.length };
+}
+
+function recoverPlanesFromExternalRgb(rgba, uvRgba, planes, params) {
+  if (params.matrix === 'rgb') return { error: 'RGB matrix metadata is not a YUV plane encoding.' };
+  if (!['linear', 'bt709', 'smpte170m', 'iec61966-2-1'].includes(params.transfer)) {
+    return { error: `Transfer ${params.transfer} is unsupported by the inverse test.` };
+  }
+
+  const inverseYuv = inv3(params.rows.map((row) => row.slice(0, 3)));
+  const inverseGamut = params.conversionOnly ? null : inv3(params.gamut);
+  const inverseSample = (samples, pixel) => {
+    let r = samples[pixel * 4];
+    let g = samples[pixel * 4 + 1];
+    let b = samples[pixel * 4 + 2];
+    if (!params.conversionOnly) {
+      [r, g, b] = applyMatrix3(inverseGamut,
+        srgbToLinearValue(r), srgbToLinearValue(g), srgbToLinearValue(b));
+      r = sourceOetf(r, params.transfer);
+      g = sourceOetf(g, params.transfer);
+      b = sourceOetf(b, params.transfer);
+    }
+    return applyMatrix3(inverseYuv,
+      r - params.rows[0][3], g - params.rows[1][3], b - params.rows[2][3]);
+  };
+
+  const recoveredY = new Float32Array(planes.W * planes.H);
+  for (let pixel = 0; pixel < recoveredY.length; pixel++) {
+    recoveredY[pixel] = inverseSample(rgba, pixel)[0] * 255;
+  }
+
+  const y = comparePlaneCodes(recoveredY, planes.yBytes);
+  const recoveredUv = new Float32Array(planes.uvBytes.length);
+  for (let sample = 0; sample < recoveredUv.length / 2; sample++) {
+    const yuv = inverseSample(uvRgba, sample);
+    recoveredUv[sample * 2] = yuv[1] * 255;
+    recoveredUv[sample * 2 + 1] = yuv[2] * 255;
+  }
+  return { y, uv: comparePlaneCodes(recoveredUv, planes.uvBytes) };
+}
+
+// =============================================================================
+// =============================================================================
+// WebGPU initialization.
+// =============================================================================
+async function initGPU() {
+  if (!navigator.gpu) throw new Error('WebGPU not available (navigator.gpu missing).');
+  const sel = $('gpuSel').value;
+  if (device && sel === adapterKey) return;
+  if (device) { destroyLastRun(); device.destroy(); device = null; }
+  adapterKey = sel;
+
+  const options = {};
+  if (sel === 'high-performance' || sel === 'low-power') options.powerPreference = sel;
+  if (sel === 'fallback') options.forceFallbackAdapter = true;
+  adapter = await navigator.gpu.requestAdapter(options);
+  if (!adapter) throw new Error(`No WebGPU adapter for selection "${sel}".`);
+  device = await adapter.requestDevice();
+  device.lost.then((info) => log(`GPU device lost: ${info.message}`, 'err'));
+  device.addEventListener('uncapturederror', (e) => log(`WebGPU error: ${e.error.message}`, 'err'));
+  const info = adapter.info;
+  if (info) {
+    log(`WebGPU adapter [${sel}]: ${[info.vendor, info.architecture, info.description].filter(Boolean).join(' / ') || '(no info)'}`, 'ok');
+  }
+
+  const mod = async (name, code) => {
+    const m = device.createShaderModule({ code });
+    for (const msg of (await m.getCompilationInfo()).messages) {
+      log(`${name} shader ${msg.type}: ${msg.message}`, msg.type === 'error' ? 'err' : '');
+    }
+    return m;
+  };
+  const refModule = await mod('reference', REF_WGSL);
+  pipelines = {
+    ref: device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: refModule, entryPoint: 'vs' },
+      fragment: { module: refModule, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+      primitive: { topology: 'triangle-list' },
+    }),
+  };
+  log('WebGPU initialized.', 'ok');
+}
+
+// =============================================================================
+// Camera -> VideoFrame via the WebCodecs VideoFrame API.
+// =============================================================================
+async function frameFromVideoElement(setup) {
+  const v = document.createElement('video');
+  v.muted = true;
+  v.playsInline = true;
+  const cleanup = await setup(v);
+  try {
+    await v.play();
+    await new Promise((r) => v.requestVideoFrameCallback(() => r()));
+    v.pause();
+    return new VideoFrame(v);
+  } finally {
+    cleanup();
+  }
+}
+
+async function acquireFrame() {
+  let stream = null;
+  const frame = await frameFromVideoElement(async (v) => {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: CAMERA_WIDTH }, height: { ideal: CAMERA_HEIGHT } }, audio: false,
+    });
+    v.srcObject = stream;
+    return () => stream.getTracks().forEach((t) => t.stop());
+  });
+  return { frame, desc: 'camera snapshot (requested 1920x1080)' };
+}
+
+// =============================================================================
+// Plane extraction.
+// =============================================================================
+async function extractPlanes(frame) {
+  const fmt = frame.format;
+  if (fmt !== 'NV12' && fmt !== 'I420') {
+    throw new Error(`Unsupported VideoFrame format "${fmt}" (need NV12 or I420).`);
+  }
+  const r = frame.visibleRect;
+  const W = r.width, H = r.height;
+  if (W % 2 || H % 2 || r.x % 2 || r.y % 2) throw new Error(`Visible rect ${r.x},${r.y} ${W}x${H} is not 2-aligned.`);
+  if (W * H >= 1 << 24) throw new Error('Frame too large for delta location packing.');
+  const rect = { x: r.x, y: r.y, width: W, height: H };
+  const yBytes = new Uint8Array(W * H);
+  const uvBytes = new Uint8Array(W * H / 2);
+  if (fmt === 'NV12') {
+    const buf = new Uint8Array(W * H * 3 / 2);
+    await frame.copyTo(buf, { rect, layout: [{ offset: 0, stride: W }, { offset: W * H, stride: W }] });
+    yBytes.set(buf.subarray(0, W * H));
+    uvBytes.set(buf.subarray(W * H));
+  } else {
+    const q = W * H / 4;
+    const buf = new Uint8Array(W * H + 2 * q);
+    await frame.copyTo(buf, {
+      rect,
+      layout: [{ offset: 0, stride: W }, { offset: W * H, stride: W / 2 }, { offset: W * H + q, stride: W / 2 }],
+    });
+    yBytes.set(buf.subarray(0, W * H));
+    for (let i = 0; i < q; i++) {
+      uvBytes[2 * i] = buf[W * H + i];
+      uvBytes[2 * i + 1] = buf[W * H + q + i];
+    }
+  }
+  return { W, H, yBytes, uvBytes };
+}
+
+// =============================================================================
+// Run.
+// =============================================================================
+function destroyLastRun() {
+  if (!lastRun) return;
+  lastRun.refTex.destroy();
+  lastRun.refRgbBuf.destroy();
+  lastRun.refUvRgbBuf.destroy();
+  lastRun = null;
+}
+
+function sourceMetaText(frame, desc, planes) {
+  const cs = frame.colorSpace;
+  const vr = frame.visibleRect;
+  const lines = [
+    'SOURCE',
+    `  origin:        ${desc}`,
+    `  format:        ${frame.format}`,
+    `  coded:         ${frame.codedWidth}x${frame.codedHeight}`,
+    `  visibleRect:   x=${vr.x} y=${vr.y} ${vr.width}x${vr.height}`,
+    `  display:       ${frame.displayWidth}x${frame.displayHeight}`,
+    `  rotation/flip: ${frame.rotation ?? 0} / ${frame.flip ?? false}`,
+    `  timestamp:     ${frame.timestamp} us`,
+    '  colorSpace:',
+    `    primaries:   ${cs.primaries}`,
+    `    transfer:    ${cs.transfer}`,
+    `    matrix:      ${cs.matrix}`,
+    `    fullRange:   ${cs.fullRange}`,
+  ];
+  if (planes) {
+    lines.push(
+      '  planes (copyTo, visible rect):',
+      `    Y:  ${planes.W}x${planes.H} u8, stride ${planes.W}`,
+      `    UV: ${planes.W / 2}x${planes.H / 2} interleaved U,V u8, stride ${planes.W}` +
+        (frame.format === 'I420' ? ' (interleaved from I420 on CPU)' : ''),
+    );
+  }
+  if (planes) {
+    lines.push(
+      '  capture:',
+      '    importExternalTexture(VideoFrame), textureSampleBaseClampToEdge',
+      `    ${$('filterSel').value} sampler -> float RGB GPUBuffer`,
+    );
+  }
+  if (frame.rotation || frame.flip) lines.push('  WARNING: rotation/flip applied by reference only');
+  return lines.join('\n');
+}
+
+async function run() {
+  $('runBtn').disabled = true;
+  let frame = null;
+  try {
+    console.log('[YUV recompose] adapter', $('gpuSel').value, 'filter', $('filterSel').value);
+    await initGPU();
+    const acquired = await acquireFrame();
+    frame = acquired.frame;
+    $('srcMeta').textContent = sourceMetaText(frame, acquired.desc, null);
+    const planes = await extractPlanes(frame);
+    $('srcMeta').textContent = sourceMetaText(frame, acquired.desc, planes);
+    await processFrame(frame, planes);
+    log('Run complete.', 'ok');
+  } catch (e) {
+    log(`${e.name}: ${e.message}`, 'err');
+  } finally {
+    if (frame) frame.close();
+    $('runBtn').disabled = false;
+  }
+}
+
+async function processFrame(frame, planes) {
+  const { W, H } = planes;
+  destroyLastRun();
+
+  const rgbBufferBytes = W * H * 16;
+  const uvRgbBufferBytes = W * H * 4;
+  if (Math.max(rgbBufferBytes, uvRgbBufferBytes) > device.limits.maxStorageBufferBindingSize) {
+    throw new Error(`Float capture needs up to ${Math.max(rgbBufferBytes, uvRgbBufferBytes)} bytes; device limit is ${device.limits.maxStorageBufferBindingSize}.`);
+  }
+  const refTex = device.createTexture({
+    size: [W, H], format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  const rgbBufferUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC;
+  const refRgbBuf = device.createBuffer({ size: rgbBufferBytes, usage: rgbBufferUsage });
+  const refUvRgbBuf = device.createBuffer({ size: uvRgbBufferBytes, usage: rgbBufferUsage });
+  const rgbReadBuf = device.createBuffer({ size: rgbBufferBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const uvRgbReadBuf = device.createBuffer({ size: uvRgbBufferBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  lastRun = { refTex, refRgbBuf, refUvRgbBuf };
+
+  const filter = $('filterSel').value;
+  const sampler = device.createSampler({ magFilter: filter, minFilter: filter });
+  const cp = colorParams(frame.colorSpace);
+
+  const refSize = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(refSize, 0, new Float32Array([W, H, 0, 0]));
+  const ext = device.importExternalTexture({ source: frame });
+  const enc = device.createCommandEncoder();
+  const draw = (pipeline, target, entries) => {
+    const pass = enc.beginRenderPass({
+      colorAttachments: [{ view: target.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries }));
+    pass.draw(3);
+    pass.end();
+  };
+  draw(pipelines.ref, refTex, [
+    { binding: 0, resource: ext },
+    { binding: 1, resource: sampler },
+    { binding: 2, resource: { buffer: refSize } },
+    { binding: 3, resource: { buffer: refRgbBuf } },
+    { binding: 4, resource: { buffer: refUvRgbBuf } },
+  ]);
+  enc.copyBufferToBuffer(refRgbBuf, 0, rgbReadBuf, 0, rgbBufferBytes);
+  enc.copyBufferToBuffer(refUvRgbBuf, 0, uvRgbReadBuf, 0, uvRgbBufferBytes);
+  device.queue.submit([enc.finish()]);
+
+  await rgbReadBuf.mapAsync(GPUMapMode.READ);
+  const externalRgb = new Float32Array(rgbReadBuf.getMappedRange().slice(0));
+  rgbReadBuf.unmap();
+  rgbReadBuf.destroy();
+  await uvRgbReadBuf.mapAsync(GPUMapMode.READ);
+  const externalUvRgb = new Float32Array(uvRgbReadBuf.getMappedRange().slice(0));
+  uvRgbReadBuf.unmap();
+  uvRgbReadBuf.destroy();
+  const recovery = recoverPlanesFromExternalRgb(externalRgb, externalUvRgb, planes, cp);
+  const recoveryLines = [
+    'RECOVERED CODE VALUES FROM GPUExternalTexture',
+    'Reference: VideoFrame.copyTo() Y and UV plane bytes',
+    `External sampler: ${filter}`,
+  ];
+  if (recovery.error) {
+    recoveryLines.push(`Recovery unavailable: ${recovery.error}`);
+  } else {
+    recoveryLines.push(
+      `Y exact byte matches: ${recovery.y.total - recovery.y.mismatches}/${recovery.y.total}`,
+      `  mismatch count: ${recovery.y.mismatches}; max pre-round error: ${recovery.y.maxError.toFixed(5)}; max rounded error: ${recovery.y.maxRoundedError}`,
+    );
+    if (recovery.uv) {
+      recoveryLines.push(
+        `UV exact byte matches: ${recovery.uv.total - recovery.uv.mismatches}/${recovery.uv.total}`,
+        `  mismatch count: ${recovery.uv.mismatches}; max pre-round error: ${recovery.uv.maxError.toFixed(5)}; max rounded error: ${recovery.uv.maxRoundedError}`,
+      );
+    } else {
+      recoveryLines.push(`UV recovery unavailable: ${recovery.uvError}`);
+    }
+    if (cp.fallbacks.length) recoveryLines.push(`Metadata assumptions: ${cp.fallbacks.join('; ')}`);
+  }
+  $('planeStats').textContent = recoveryLines.join('\n');
+  refSize.destroy();
+}
+
+// =============================================================================
+// UI wiring + shareable URL config (same encoding as super_resolution_ssr).
+// =============================================================================
+const URL_PARAMS = {
+  adapter: 'gpuSel',
+  filter: 'filterSel',
+};
+function applyConfigFromURL() {
+  const q = new URLSearchParams(location.search);
+  for (const [key, id] of Object.entries(URL_PARAMS)) {
+    const val = q.get(key);
+    if (val != null && [...$(id).options].some((o) => o.value === val)) $(id).value = val;
+  }
+}
+function syncURLFromConfig() {
+  const q = new URLSearchParams();
+  for (const [key, id] of Object.entries(URL_PARAMS)) q.set(key, $(id).value);
+  history.replaceState(null, '', `${location.pathname}?${q.toString()}`);
+}
+for (const id of Object.values(URL_PARAMS)) $(id).addEventListener('change', syncURLFromConfig);
+$('runBtn').addEventListener('click', run);
+$('copyLinkBtn').addEventListener('click', async () => {
+  syncURLFromConfig();
+  try {
+    await navigator.clipboard.writeText(location.href);
+    log('Config URL copied to clipboard.', 'ok');
+  } catch {
+    log('Copy failed; copy the address-bar URL manually.', 'err');
+  }
+});
+
+applyConfigFromURL();
+syncURLFromConfig();
+
+function reportStatus() {
+  log(`WebGPU: ${navigator.gpu ? 'available' : 'NOT available'}`, navigator.gpu ? 'ok' : 'err');
+  const wc = typeof VideoFrame !== 'undefined';
+  log(`WebCodecs VideoFrame: ${wc ? 'available' : 'NOT available'}`, wc ? 'ok' : 'err');
+}
+log('Ready. Press Run to capture a camera snapshot.');
+reportStatus();
+</script>
+</body>
+</html>
