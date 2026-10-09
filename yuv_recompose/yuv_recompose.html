@@ -224,7 +224,7 @@ function sourceOetf(value, transfer) {
   const magnitude = Math.abs(value);
   const sign = Math.sign(value);
   if (transfer === 'bt709' || transfer === 'smpte170m') {
-    return sign * (magnitude < 0.018 ? 4.5 * magnitude : 1.099 * magnitude ** 0.45 - 0.099);
+    return sign * (magnitude < 0.0812 / 4.5 ? 4.5 * magnitude : 1.099 * magnitude ** 0.45 - 0.099);
   }
   if (transfer === 'iec61966-2-1') {
     return sign * (magnitude <= 0.0031308 ? 12.92 * magnitude : 1.055 * magnitude ** (1 / 2.4) - 0.055);
@@ -237,7 +237,7 @@ function sourceEotf(value, transfer) {
   const magnitude = Math.abs(value);
   const sign = Math.sign(value);
   if (transfer === 'bt709' || transfer === 'smpte170m') {
-    return sign * (magnitude < 0.081 ? magnitude / 4.5 : ((magnitude + 0.099) / 1.099) ** (1 / 0.45));
+    return sign * (magnitude < 0.0812 ? magnitude / 4.5 : ((magnitude + 0.099) / 1.099) ** (1 / 0.45));
   }
   if (transfer === 'iec61966-2-1') return srgbToLinearValue(value);
   return NaN;
