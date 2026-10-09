@@ -132,6 +132,9 @@ const KR_KB = {
   smpte170m: [0.299, 0.114],
   'bt2020-ncl': [0.2627, 0.0593],
 };
+const SRGB_EQUIVALENT_TRANSFERS = new Set([
+  'bt709', 'smpte170m', 'bt2020-10', 'bt2020-12', 'iec61966-2-1',
+]);
 const PRIMARIES = {
   bt709: [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]],
   bt470bg: [[0.64, 0.33], [0.29, 0.60], [0.15, 0.06]],
@@ -202,7 +205,7 @@ function colorParams(colorSpace) {
   const sourceToXyz = rgbToXyz(PRIMARIES[primaries]);
   const destinationFromXyz = inv3(rgbToXyz(PRIMARIES.bt709));
   const gamut = mul3(destinationFromXyz, sourceToXyz);
-  const conversionOnly = primaries === 'bt709' && transfer === 'iec61966-2-1';
+  const conversionOnly = primaries === 'bt709' && SRGB_EQUIVALENT_TRANSFERS.has(transfer);
   return { matrix, fullRange, primaries, transfer, rows, gamut, conversionOnly, fallbacks };
 }
 
@@ -223,10 +226,7 @@ function sourceOetf(value, transfer) {
   if (transfer === 'linear') return value;
   const magnitude = Math.abs(value);
   const sign = Math.sign(value);
-  if (transfer === 'bt709' || transfer === 'smpte170m') {
-    return sign * (magnitude < 0.0812 / 4.5 ? 4.5 * magnitude : 1.099 * magnitude ** 0.45 - 0.099);
-  }
-  if (transfer === 'iec61966-2-1') {
+  if (SRGB_EQUIVALENT_TRANSFERS.has(transfer)) {
     return sign * (magnitude <= 0.0031308 ? 12.92 * magnitude : 1.055 * magnitude ** (1 / 2.4) - 0.055);
   }
   return NaN;
@@ -234,12 +234,7 @@ function sourceOetf(value, transfer) {
 
 function sourceEotf(value, transfer) {
   if (transfer === 'linear') return value;
-  const magnitude = Math.abs(value);
-  const sign = Math.sign(value);
-  if (transfer === 'bt709' || transfer === 'smpte170m') {
-    return sign * (magnitude < 0.0812 ? magnitude / 4.5 : ((magnitude + 0.099) / 1.099) ** (1 / 0.45));
-  }
-  if (transfer === 'iec61966-2-1') return srgbToLinearValue(value);
+  if (SRGB_EQUIVALENT_TRANSFERS.has(transfer)) return srgbToLinearValue(value);
   return NaN;
 }
 
@@ -264,7 +259,7 @@ function sampleCopiedChroma(planes, x, y, channel, filter) {
 
 function forwardRgbFromCopiedPlanes(planes, params, filter) {
   if (params.matrix === 'rgb') return { error: 'RGB matrix metadata is not a YUV plane encoding.' };
-  if (!['linear', 'bt709', 'smpte170m', 'iec61966-2-1'].includes(params.transfer)) {
+  if (params.transfer !== 'linear' && !SRGB_EQUIVALENT_TRANSFERS.has(params.transfer)) {
     return { error: `Transfer ${params.transfer} is unsupported by the forward test.` };
   }
 
@@ -330,7 +325,7 @@ function comparePlaneCodes(recovered, copied) {
 
 function recoverPlanesFromExternalRgb(rgba, uvRgba, planes, params) {
   if (params.matrix === 'rgb') return { error: 'RGB matrix metadata is not a YUV plane encoding.' };
-  if (!['linear', 'bt709', 'smpte170m', 'iec61966-2-1'].includes(params.transfer)) {
+  if (params.transfer !== 'linear' && !SRGB_EQUIVALENT_TRANSFERS.has(params.transfer)) {
     return { error: `Transfer ${params.transfer} is unsupported by the inverse test.` };
   }
 
