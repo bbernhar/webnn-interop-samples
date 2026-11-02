@@ -8,9 +8,6 @@ Samples are organized by workload, one folder per sample:
 - `super_resolution_ssr/`
   - `super_resolution_ssr.html`
   - `README.md`
-- `webgpu_stress/`
-  - `webgpu_stress.html`
-  - `README.md`
 - `yuv_recompose/`
   - `yuv_recompose.html`
   - `README.md`
@@ -20,7 +17,6 @@ Samples are organized by workload, one folder per sample:
 Run the workloads directly in a browser from the hosted pages:
 - Super Resolution 10: https://bbernhar.github.io/webnn-interop-samples/super_resolution_10/super_resolution_10.html
 - Simple SR: https://bbernhar.github.io/webnn-interop-samples/super_resolution_ssr/super_resolution_ssr.html
-- WebGPU Stress: https://bbernhar.github.io/webnn-interop-samples/webgpu_stress/webgpu_stress.html
 - YUV Recompose: https://bbernhar.github.io/webnn-interop-samples/yuv_recompose/yuv_recompose.html
 
 ## Requirements
